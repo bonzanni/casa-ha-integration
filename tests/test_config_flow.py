@@ -115,3 +115,58 @@ class TestOptions:
         })
         assert result["type"] == "create_entry"
         assert result["data"][CONF_TRANSPORT] == "sse"
+
+
+class TestHassio:
+    @pytest.mark.asyncio
+    async def test_hassio_discovery_happy(self):
+        from homeassistant.helpers.service_info.hassio import HassioServiceInfo
+        flow = CasaConfigFlow()
+        flow.hass = MagicMock()
+        info = HassioServiceInfo(
+            config={"host": "h", "port": 18065, "webhook_secret": "s"},
+            name="Casa Butler",
+            slug="casa_butler",
+            uuid="uuid-1",
+        )
+        result = await flow.async_step_hassio(info)
+        assert result["type"] == "form"
+        assert result["step_id"] == "hassio_confirm"
+
+    @pytest.mark.asyncio
+    async def test_hassio_confirm_creates_entry(self):
+        flow = CasaConfigFlow()
+        flow.hass = MagicMock()
+        flow._host = "h"
+        flow._port = 18065
+        flow._secret = "s"
+        flow._discovery_name = "Casa Butler"
+        with patch("custom_components.casa.config_flow._validate_connection", AsyncMock()):
+            result = await flow.async_step_hassio_confirm({"confirm": True})
+        assert result["type"] == "create_entry"
+        assert result["title"] == "Casa Butler"
+
+    @pytest.mark.asyncio
+    async def test_hassio_confirm_retries_on_connection_error(self, monkeypatch):
+        flow = CasaConfigFlow()
+        flow.hass = MagicMock()
+        flow._host = "h"
+        flow._port = 18065
+        flow._secret = "s"
+        flow._discovery_name = "Casa Butler"
+
+        calls = {"n": 0}
+
+        async def flaky(hass, data):
+            calls["n"] += 1
+            raise aiohttp.ClientError("nope")
+
+        async def _no_sleep(*a, **kw):
+            return None
+
+        monkeypatch.setattr("custom_components.casa.config_flow._validate_connection", flaky)
+        monkeypatch.setattr("custom_components.casa.config_flow.asyncio.sleep", _no_sleep)
+        result = await flow.async_step_hassio_confirm({"confirm": True})
+        assert calls["n"] == 3
+        assert result["type"] == "form"
+        assert result["errors"]["base"] == "cannot_connect"
