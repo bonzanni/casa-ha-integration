@@ -126,3 +126,73 @@ class TestHandleMessageHappy:
         assert seen["context"]["conversation_id"] == "c-1"
         assert seen["transport"] == "ws"
         assert "utterance_id" in seen
+
+
+from custom_components.casa.api import ErrorFrame, AuthenticationError
+from custom_components.casa.const import FALLBACK, SILENT_STREAM_FALLBACK
+
+
+class TestHandleMessageErrors:
+    @pytest.mark.asyncio
+    async def test_casa_error_with_spoken(self):
+        ent = _entity()
+        ent._client.stream_utterance = MagicMock(return_value=_aiter([
+            ErrorFrame(kind_="timeout", spoken="[flat] That took too long."),
+        ]))
+        ui = _input(device_id="d-1")
+        chat_log = _ChatLogCapture()
+        result = await ent._async_handle_message(ui, chat_log)
+        # Entity returned a ConversationResult; drill into response.
+        assert "[flat] That took too long." in result.response._speech["speech"]
+        assert result.response._speech["type"] == "plain"
+
+    @pytest.mark.asyncio
+    async def test_casa_error_empty_spoken_uses_fallback(self):
+        ent = _entity()
+        ent._client.stream_utterance = MagicMock(return_value=_aiter([
+            ErrorFrame(kind_="sdk_error", spoken=""),
+        ]))
+        ui = _input(device_id="d-1")
+        chat_log = _ChatLogCapture()
+        result = await ent._async_handle_message(ui, chat_log)
+        assert result.response._speech["speech"] == FALLBACK
+
+    @pytest.mark.asyncio
+    async def test_authentication_triggers_reauth(self):
+        ent = _entity()
+        ent.entry.async_start_reauth = MagicMock()
+        ent.hass = MagicMock()
+
+        async def raising(**kw):
+            raise AuthenticationError("bad secret")
+            yield
+
+        ent._client.stream_utterance = MagicMock(side_effect=raising)
+        ui = _input(device_id="d-1")
+        chat_log = _ChatLogCapture()
+        await ent._async_handle_message(ui, chat_log)
+        ent.entry.async_start_reauth.assert_called_once_with(ent.hass)
+
+    @pytest.mark.asyncio
+    async def test_zero_content_done_triggers_silent_fallback(self):
+        ent = _entity()
+        ent._client.stream_utterance = MagicMock(return_value=_aiter([
+            DoneFrame(),
+        ]))
+        ui = _input(device_id="d-1")
+        chat_log = _ChatLogCapture()
+        result = await ent._async_handle_message(ui, chat_log)
+        assert result.response._speech["speech"] == SILENT_STREAM_FALLBACK
+
+    @pytest.mark.asyncio
+    async def test_empty_block_text_is_skipped(self):
+        ent = _entity()
+        ent._client.stream_utterance = MagicMock(return_value=_aiter([
+            BlockFrame(text="", final=False),
+            BlockFrame(text="real", final=False),
+            DoneFrame(),
+        ]))
+        ui = _input(device_id="d-1")
+        chat_log = _ChatLogCapture()
+        await ent._async_handle_message(ui, chat_log)
+        assert [d["content"] for d in chat_log.deltas] == ["real"]
