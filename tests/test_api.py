@@ -286,3 +286,67 @@ class TestStreamUtteranceWS:
         assert sent["agent_role"] == "butler"
         assert sent["scope_id"] == "dev-42"
         assert sent["context"]["language"] == "en"
+
+
+class TestWsCancel:
+    @pytest.mark.asyncio
+    async def test_iterator_cancel_sends_cancel_frame(self):
+        import custom_components.casa.api as api_mod
+        session = MagicMock()
+        ws = _FakeWS(outgoing=[
+            _FakeWSMsg("TEXT", json.dumps({
+                "type": "block", "utterance_id": "u", "text": "hi", "final": False,
+            })),
+            # intentionally no "done" — we cancel mid-stream.
+        ])
+        session.ws_connect = AsyncMock(return_value=ws)
+        client = api_mod.CasaApiClient(session=session, host="h", port=1, webhook_secret="sec")
+
+        agen = client.stream_utterance(
+            text="hi", agent_role="butler", scope_id="d",
+            utterance_id="u", context={}, transport="ws",
+        )
+        first = await agen.__anext__()
+        assert first.text == "hi"
+        await agen.aclose()
+
+        cancel_frames = [s for s in ws.sent if s.get("type") == "cancel"]
+        assert cancel_frames
+        assert cancel_frames[0]["utterance_id"] == "u"
+
+
+class TestPrewarm:
+    @pytest.mark.asyncio
+    async def test_ws_prewarm_sends_stt_start(self):
+        import custom_components.casa.api as api_mod
+        session = MagicMock()
+        ws = _FakeWS(outgoing=[])
+        session.ws_connect = AsyncMock(return_value=ws)
+        client = api_mod.CasaApiClient(session=session, host="h", port=1, webhook_secret="sec")
+        await client.prewarm(scope_id="dev-1", transport="ws")
+        sent = [s for s in ws.sent if s.get("type") == "stt_start"]
+        assert sent
+        assert sent[0]["scope_id"] == "dev-1"
+        assert sent[0]["session_key"] == "voice:dev-1"
+
+    @pytest.mark.asyncio
+    async def test_sse_prewarm_noops(self, api_client: CasaApiClient, mock_session: MagicMock):
+        # SSE transport: prewarm must return without raising and without any network call.
+        mock_session.post = AsyncMock()
+        mock_session.ws_connect = AsyncMock()
+        await api_client.prewarm(scope_id="dev-1", transport="sse")
+        mock_session.post.assert_not_called()
+        mock_session.ws_connect.assert_not_called()
+
+
+class TestClose:
+    @pytest.mark.asyncio
+    async def test_close_closes_ws(self):
+        import custom_components.casa.api as api_mod
+        session = MagicMock()
+        ws = _FakeWS(outgoing=[])
+        session.ws_connect = AsyncMock(return_value=ws)
+        client = api_mod.CasaApiClient(session=session, host="h", port=1, webhook_secret="sec")
+        await client._ensure_ws()
+        await client.close()
+        assert ws.closed is True

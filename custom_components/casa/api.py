@@ -89,17 +89,20 @@ class CasaApiClient:
         transport: str = "ws",
     ) -> AsyncIterator[Any]:
         if transport == "sse":
-            async for frame in self._stream_utterance_sse(
+            inner = self._stream_utterance_sse(
                 text=text, agent_role=agent_role, scope_id=scope_id,
                 utterance_id=utterance_id, context=context,
-            ):
-                yield frame
+            )
         else:
-            async for frame in self._stream_utterance_ws(
+            inner = self._stream_utterance_ws(
                 text=text, agent_role=agent_role, scope_id=scope_id,
                 utterance_id=utterance_id, context=context,
-            ):
+            )
+        try:
+            async for frame in inner:
                 yield frame
+        finally:
+            await inner.aclose()
 
     async def _stream_utterance_sse(
         self, *, text, agent_role, scope_id, utterance_id, context,
@@ -192,6 +195,7 @@ class CasaApiClient:
         ws = await self._ensure_ws()
         queue: asyncio.Queue = asyncio.Queue()
         self._ws_queues[utterance_id] = queue
+        terminated = False
         try:
             await ws.send_json({
                 "type": "utterance",
@@ -205,15 +209,45 @@ class CasaApiClient:
                 frame = await queue.get()
                 t = frame.get("type")
                 if t == "__closed__":
+                    terminated = True
                     yield ErrorFrame(kind_="connection", spoken="")
                     return
                 if t == "block":
                     yield BlockFrame(text=frame.get("text", ""), final=bool(frame.get("final", False)))
                 elif t == "error":
+                    terminated = True
                     yield ErrorFrame(kind_=frame.get("kind", "unknown"), spoken=frame.get("spoken", ""))
                     return
                 elif t == "done":
+                    terminated = True
                     yield DoneFrame()
                     return
         finally:
             self._ws_queues.pop(utterance_id, None)
+            if not terminated:
+                ws = self._ws
+                if ws is not None and not ws.closed:
+                    try:
+                        await ws.send_json({"type": "cancel", "utterance_id": utterance_id})
+                    except Exception:
+                        _LOGGER.debug("Cancel frame failed — connection likely closed", exc_info=True)
+
+    async def prewarm(self, scope_id: str, transport: str = "ws") -> None:
+        if transport != "ws":
+            _LOGGER.debug("Prewarm requested on SSE transport — no-op")
+            return
+        ws = await self._ensure_ws()
+        await ws.send_json({
+            "type": "stt_start",
+            "session_key": f"voice:{scope_id}",
+            "scope_id": scope_id,
+            "context": {},
+        })
+
+    async def close(self) -> None:
+        if self._ws_reader is not None and not self._ws_reader.done():
+            self._ws_reader.cancel()
+        if self._ws is not None and not self._ws.closed:
+            await self._ws.close()
+        self._ws = None
+        self._ws_reader = None
