@@ -1,0 +1,15 @@
+{
+  "domain": "casa",
+  "name": "Casa",
+  "codeowners": ["@bonzanni"],
+  "config_flow": true,
+  "dependencies": ["conversation"],
+  "after_dependencies": ["assist_pipeline", "intent", "hassio", "assist_satellite"],
+  "documentation": "https://github.com/bonzanni/casa-ha-integration",
+  "iot_class": "local_polling",
+  "requirements": [],
+  "version": "0.1.0",
+  "integration_type": "service",
+  "quality_scale": "custom",
+  "loggers": ["custom_components.casa"]
+}
