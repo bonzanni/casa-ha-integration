@@ -6,6 +6,7 @@ import asyncio
 import hashlib
 import hmac
 import json
+import logging
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from typing import Any
@@ -22,6 +23,8 @@ from .const import (
     WS_RECONNECT_MAX,
     WS_RECONNECT_MIN,
 )
+
+_LOGGER = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -61,6 +64,11 @@ class CasaApiClient:
         self._base_url = f"http://{host}:{port}"
         self._ws_url = f"ws://{host}:{port}{WS_PATH}"
         self._secret = webhook_secret
+        self._ws: aiohttp.ClientWebSocketResponse | None = None
+        self._ws_lock = asyncio.Lock()
+        self._ws_reader: asyncio.Task | None = None
+        self._ws_queues: dict[str, asyncio.Queue] = {}
+        self._ws_backoff = WS_RECONNECT_MIN
 
     def _sign(self, body: bytes) -> str:
         return hmac.new(self._secret.encode(), body, hashlib.sha256).hexdigest()
@@ -143,7 +151,69 @@ class CasaApiClient:
         # If SSE closes without `done`, synthesise one so callers terminate.
         yield DoneFrame()
 
+    async def _ensure_ws(self) -> aiohttp.ClientWebSocketResponse:
+        async with self._ws_lock:
+            if self._ws is not None and not self._ws.closed:
+                return self._ws
+            headers = {"X-Webhook-Signature": self._sign(b"")}
+            try:
+                self._ws = await self._session.ws_connect(
+                    self._ws_url, headers=headers, heartbeat=30,
+                )
+            except aiohttp.WSServerHandshakeError as err:
+                if err.status == 401:
+                    raise AuthenticationError("Invalid webhook secret") from err
+                raise
+            self._ws_backoff = WS_RECONNECT_MIN
+            self._ws_reader = asyncio.create_task(self._read_loop(self._ws))
+            return self._ws
+
+    async def _read_loop(self, ws: aiohttp.ClientWebSocketResponse) -> None:
+        try:
+            async for msg in ws:
+                if msg.type.name != "TEXT":
+                    continue
+                try:
+                    frame = json.loads(msg.data)
+                except json.JSONDecodeError:
+                    continue
+                uid = frame.get("utterance_id")
+                queue = self._ws_queues.get(uid) if uid else None
+                if queue is None:
+                    continue
+                await queue.put(frame)
+        finally:
+            for q in list(self._ws_queues.values()):
+                await q.put({"type": "__closed__"})
+
     async def _stream_utterance_ws(
         self, *, text, agent_role, scope_id, utterance_id, context,
     ) -> AsyncIterator[Any]:
-        raise NotImplementedError  # Task 5 implements WS path
+        ws = await self._ensure_ws()
+        queue: asyncio.Queue = asyncio.Queue()
+        self._ws_queues[utterance_id] = queue
+        try:
+            await ws.send_json({
+                "type": "utterance",
+                "utterance_id": utterance_id,
+                "text": text,
+                "agent_role": agent_role,
+                "scope_id": scope_id,
+                "context": context,
+            })
+            while True:
+                frame = await queue.get()
+                t = frame.get("type")
+                if t == "__closed__":
+                    yield ErrorFrame(kind_="connection", spoken="")
+                    return
+                if t == "block":
+                    yield BlockFrame(text=frame.get("text", ""), final=bool(frame.get("final", False)))
+                elif t == "error":
+                    yield ErrorFrame(kind_=frame.get("kind", "unknown"), spoken=frame.get("spoken", ""))
+                    return
+                elif t == "done":
+                    yield DoneFrame()
+                    return
+        finally:
+            self._ws_queues.pop(utterance_id, None)

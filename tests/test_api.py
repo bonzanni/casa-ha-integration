@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from unittest.mock import AsyncMock, MagicMock
 
+import aiohttp
 import pytest
 
 from custom_components.casa.api import (
@@ -157,3 +158,131 @@ class TestStreamUtteranceSSE:
                 utterance_id="u", context={}, transport="sse",
             ):
                 pass
+
+
+class _FakeWS:
+    def __init__(self, outgoing=None):
+        self.sent: list[dict] = []
+        self._outgoing = list(outgoing or [])
+        self.closed = False
+
+    async def send_json(self, data):
+        self.sent.append(data)
+
+    async def close(self):
+        self.closed = True
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        if not self._outgoing:
+            raise StopAsyncIteration
+        msg = self._outgoing.pop(0)
+        return msg
+
+
+class _FakeWSMsg:
+    def __init__(self, type_name: str, data: str = ""):
+        self.type = type("T", (), {"name": type_name})()
+        self.data = data
+
+
+class TestStreamUtteranceWS:
+    @pytest.mark.asyncio
+    async def test_ws_upgrade_hmac(self):
+        import custom_components.casa.api as api_mod
+        captured = {}
+
+        session = MagicMock()
+
+        async def fake_ws_connect(url, **kw):
+            captured["url"] = url
+            captured["headers"] = kw.get("headers")
+            return _FakeWS(outgoing=[
+                _FakeWSMsg("TEXT", json.dumps({
+                    "type": "done", "utterance_id": "u-1",
+                })),
+            ])
+
+        session.ws_connect = AsyncMock(side_effect=fake_ws_connect)
+        client = api_mod.CasaApiClient(session=session, host="h", port=1, webhook_secret="sec")
+
+        frames = []
+        async for f in client.stream_utterance(
+            text="hi", agent_role="butler", scope_id="d",
+            utterance_id="u-1", context={}, transport="ws",
+        ):
+            frames.append(f)
+
+        import hashlib, hmac as _hmac
+        expected = _hmac.new(b"sec", b"", hashlib.sha256).hexdigest()
+        assert captured["headers"]["X-Webhook-Signature"] == expected
+        assert captured["url"].endswith("/api/converse/ws")
+        assert any(f.kind == "done" for f in frames)
+
+    @pytest.mark.asyncio
+    async def test_ws_401_raises(self):
+        import custom_components.casa.api as api_mod
+        session = MagicMock()
+        err = aiohttp.WSServerHandshakeError(
+            request_info=MagicMock(), history=(), status=401, message="Unauthorized",
+        )
+        session.ws_connect = AsyncMock(side_effect=err)
+        client = api_mod.CasaApiClient(session=session, host="h", port=1, webhook_secret="sec")
+        with pytest.raises(api_mod.AuthenticationError):
+            async for _ in client.stream_utterance(
+                text="hi", agent_role="butler", scope_id="d",
+                utterance_id="u", context={}, transport="ws",
+            ):
+                pass
+
+    @pytest.mark.asyncio
+    async def test_ws_demux_by_utterance_id(self):
+        import custom_components.casa.api as api_mod
+        session = MagicMock()
+        ws = _FakeWS(outgoing=[
+            _FakeWSMsg("TEXT", json.dumps({
+                "type": "block", "utterance_id": "OTHER",
+                "text": "ignored", "final": False,
+            })),
+            _FakeWSMsg("TEXT", json.dumps({
+                "type": "block", "utterance_id": "u-mine",
+                "text": "mine", "final": False,
+            })),
+            _FakeWSMsg("TEXT", json.dumps({
+                "type": "done", "utterance_id": "u-mine",
+            })),
+        ])
+        session.ws_connect = AsyncMock(return_value=ws)
+        client = api_mod.CasaApiClient(session=session, host="h", port=1, webhook_secret="sec")
+        frames = []
+        async for f in client.stream_utterance(
+            text="hi", agent_role="butler", scope_id="d",
+            utterance_id="u-mine", context={}, transport="ws",
+        ):
+            frames.append(f)
+        texts = [f.text for f in frames if f.kind == "block"]
+        assert texts == ["mine"]
+
+    @pytest.mark.asyncio
+    async def test_ws_sends_utterance_frame(self):
+        import custom_components.casa.api as api_mod
+        session = MagicMock()
+        ws = _FakeWS(outgoing=[
+            _FakeWSMsg("TEXT", json.dumps({"type": "done", "utterance_id": "u"})),
+        ])
+        session.ws_connect = AsyncMock(return_value=ws)
+        client = api_mod.CasaApiClient(session=session, host="h", port=1, webhook_secret="sec")
+        async for _ in client.stream_utterance(
+            text="hello", agent_role="butler", scope_id="dev-42",
+            utterance_id="u", context={"language": "en"}, transport="ws",
+        ):
+            pass
+        sent = ws.sent[0]
+        assert sent["type"] == "utterance"
+        assert sent["utterance_id"] == "u"
+        assert sent["text"] == "hello"
+        assert sent["agent_role"] == "butler"
+        assert sent["scope_id"] == "dev-42"
+        assert sent["context"]["language"] == "en"
