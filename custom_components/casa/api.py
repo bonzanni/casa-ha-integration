@@ -251,3 +251,25 @@ class CasaApiClient:
             await self._ws.close()
         self._ws = None
         self._ws_reader = None
+
+    async def probe_auth(self) -> None:
+        """Verify the webhook secret by sending an HMAC-signed empty-prompt POST.
+
+        Casa's SSE handler returns 400 "missing 'prompt'" when HMAC is valid
+        and the body lacks a prompt, and 401 when HMAC is invalid. So a 400
+        here is the success signal for auth; 401 raises AuthenticationError.
+        """
+        body = json.dumps({}).encode("utf-8")
+        headers = {
+            "Content-Type": "application/json",
+            "X-Webhook-Signature": self._sign(body),
+        }
+        async with asyncio.timeout(TIMEOUT_HEALTH):
+            resp = await self._session.post(
+                f"{self._base_url}{SSE_PATH}",
+                data=body,
+                headers=headers,
+            )
+        if resp.status == 401:
+            raise AuthenticationError("Invalid webhook secret")
+        # Any other status (400 expected, 200/404/etc. all count as "secret accepted").
