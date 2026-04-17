@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from custom_components.casa.api import BlockFrame, DoneFrame
 from custom_components.casa.conversation import CasaConversationEntity
 from custom_components.casa.const import (
     CONF_AGENT_ROLE, CONF_SESSION_MODE, CONF_TRANSPORT,
@@ -63,3 +64,65 @@ class TestScopeId:
     def test_conversation_mode(self):
         ent = _entity(SESSION_MODE_CONVERSATION)
         assert ent._build_scope_id(_input(device_id="d-1", user_id="u-1")) == "c-1"
+
+
+async def _aiter(frames):
+    for f in frames:
+        yield f
+
+
+class _ChatLogCapture:
+    """Fake ChatLog that records the deltas fed into its stream."""
+
+    def __init__(self):
+        self.deltas: list[dict] = []
+
+    async def async_add_delta_content_stream(self, agent_id, deltas):
+        async for d in deltas:
+            self.deltas.append(d)
+            yield d
+
+
+class TestHandleMessageHappy:
+    @pytest.mark.asyncio
+    async def test_streams_blocks_as_deltas(self):
+        ent = _entity()
+        ent._client.stream_utterance = MagicMock(return_value=_aiter([
+            BlockFrame(text="Hello", final=False),
+            BlockFrame(text=" world", final=True),
+            DoneFrame(),
+        ]))
+        ent._client.prewarm = AsyncMock()
+
+        ui = _input(device_id="d-1")
+        chat_log = _ChatLogCapture()
+        result = await ent._async_handle_message(ui, chat_log)
+
+        assert len(chat_log.deltas) == 2
+        assert chat_log.deltas[0]["role"] == "assistant"
+        assert chat_log.deltas[0]["content"] == "Hello"
+        assert "role" not in chat_log.deltas[1]
+        assert chat_log.deltas[1]["content"] == " world"
+
+    @pytest.mark.asyncio
+    async def test_forwards_context_and_scope(self):
+        ent = _entity()
+        seen = {}
+
+        def spy(**kw):
+            seen.update(kw)
+            return _aiter([DoneFrame()])
+
+        ent._client.stream_utterance = MagicMock(side_effect=spy)
+
+        ui = _input(device_id="d-1", user_id="u-1")
+        chat_log = _ChatLogCapture()
+        await ent._async_handle_message(ui, chat_log)
+        assert seen["scope_id"] == "d-1"
+        assert seen["agent_role"] == "butler"
+        assert seen["context"]["device_id"] == "d-1"
+        assert seen["context"]["user_id"] == "u-1"
+        assert seen["context"]["language"] == "en"
+        assert seen["context"]["conversation_id"] == "c-1"
+        assert seen["transport"] == "ws"
+        assert "utterance_id" in seen
