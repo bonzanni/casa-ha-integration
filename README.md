@@ -25,9 +25,11 @@ Open the integration **Configure** panel to change:
 - **Session mode** — how memory scope is derived: `device` (default), `user`, `conversation`.
 - **Transport** — `ws` (default, enables barge-in + voice session registration) or `sse` (stateless fallback).
 
-## Manual E2E checklist
+## E2E checklist
 
-Before tagging a release, run this end-to-end against the user's real HA + Casa add-on:
+Run end-to-end against a real HA + Casa add-on before tagging a release. Last verified
+2026-07-11 against HA Core 2026.6.4, HACS 2.0.5, and Casa add-on 0.65.2 — all steps green
+(steps 2/4 exercised at the protocol/log level rather than with live satellite audio).
 
 1. HACS install completes. Config flow accepts valid secret; rejects invalid secret with the `Invalid webhook secret` error.
 2. Assign Casa Butler as pipeline conversation agent. Voice turn from a satellite flows STT → Casa → TTS with audible butler reply.
