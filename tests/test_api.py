@@ -315,26 +315,26 @@ class TestWsCancel:
         assert cancel_frames[0]["utterance_id"] == "u"
 
 
-class TestPrewarm:
+class TestSessionRegistration:
     @pytest.mark.asyncio
-    async def test_ws_prewarm_sends_stt_start(self):
+    async def test_ws_registration_sends_stt_start(self):
         import custom_components.casa.api as api_mod
         session = MagicMock()
         ws = _FakeWS(outgoing=[])
         session.ws_connect = AsyncMock(return_value=ws)
         client = api_mod.CasaApiClient(session=session, host="h", port=1, webhook_secret="sec")
-        await client.prewarm(scope_id="dev-1", transport="ws")
+        await client.register_session(scope_id="dev-1", transport="ws")
         sent = [s for s in ws.sent if s.get("type") == "stt_start"]
         assert sent
         assert sent[0]["scope_id"] == "dev-1"
         assert sent[0]["session_key"] == "voice:dev-1"
 
     @pytest.mark.asyncio
-    async def test_sse_prewarm_noops(self, api_client: CasaApiClient, mock_session: MagicMock):
-        # SSE transport: prewarm must return without raising and without any network call.
+    async def test_sse_registration_noops(self, api_client: CasaApiClient, mock_session: MagicMock):
+        # SSE transport: registration must return without raising and without any network call.
         mock_session.post = AsyncMock()
         mock_session.ws_connect = AsyncMock()
-        await api_client.prewarm(scope_id="dev-1", transport="sse")
+        await api_client.register_session(scope_id="dev-1", transport="sse")
         mock_session.post.assert_not_called()
         mock_session.ws_connect.assert_not_called()
 

@@ -1,6 +1,6 @@
 # Casa HA Integration
 
-Companion custom integration that routes Home Assistant's Assist pipeline through the [Casa add-on](https://github.com/bonzanni/casa-ha-app) — a multi-agent AI assistant built around Claude. Ships streaming TTS deltas, low-latency memory prewarm via `assist_satellite` state listening, and a "never silent" error path.
+Companion custom integration that routes Home Assistant's Assist pipeline through the [Casa add-on](https://github.com/bonzanni/casa-ha-app) — a multi-agent AI assistant built around Claude. Ships streaming TTS deltas, voice session registration via `assist_satellite` state listening, and a "never silent" error path.
 
 ## Requirements
 
@@ -23,7 +23,7 @@ Open the integration **Configure** panel to change:
 
 - **Agent role** — which Casa agent handles turns. Default: `butler`.
 - **Session mode** — how memory scope is derived: `device` (default), `user`, `conversation`.
-- **Transport** — `ws` (default, enables prewarm + barge-in) or `sse` (stateless fallback).
+- **Transport** — `ws` (default, enables barge-in + voice session registration) or `sse` (stateless fallback).
 
 ## Manual E2E checklist
 
@@ -31,10 +31,10 @@ Before tagging a release, run this end-to-end against the user's real HA + Casa 
 
 1. HACS install completes. Config flow accepts valid secret; rejects invalid secret with the `Invalid webhook secret` error.
 2. Assign Casa Butler as pipeline conversation agent. Voice turn from a satellite flows STT → Casa → TTS with audible butler reply.
-3. Trigger a satellite wake. Casa logs `Voice prewarm scope=<device_id>` before the utterance arrives.
+3. Trigger a satellite wake with debug logging enabled for `custom_components.casa`. HA logs `Registering voice session scope=<device_id>` before the utterance arrives. (Casa 0.4x+ registers the scope for idle-sweep/dedup only; it no longer prewarms memory on `stt_start`.)
 4. Barge in mid-TTS. Casa receives a `cancel` frame for the in-flight utterance; HA recovers; next turn succeeds.
 5. Disconnect Casa mid-conversation. Satellite speaks the fallback line, HA does not go silent, reconnect recovers without integration reload.
-6. Switch **Transport** to `sse` via Options. Integration reloads. One full turn works (no prewarm, expected).
+6. Switch **Transport** to `sse` via Options. Integration reloads. One full turn works (no session registration, expected).
 7. Change the webhook secret on Casa without updating HA. Next turn triggers reauth; entering the new secret restores normal operation.
 
 ## Architecture

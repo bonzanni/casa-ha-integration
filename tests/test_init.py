@@ -32,7 +32,7 @@ class TestSetup:
         hass.config_entries.async_forward_entry_setups = AsyncMock()
         entry = _entry()
         with patch("custom_components.casa.CasaApiClient") as mock_cls, \
-             patch("custom_components.casa.PrewarmListener") as mock_listener:
+             patch("custom_components.casa.SessionRegistrationListener") as mock_listener:
             client_inst = MagicMock()
             client_inst.health_check = AsyncMock(return_value=True)
             mock_cls.return_value = client_inst
@@ -62,7 +62,7 @@ class TestSetup:
         hass.config_entries.async_unload_platforms = AsyncMock(return_value=True)
         entry = _entry()
         with patch("custom_components.casa.CasaApiClient") as mock_cls, \
-             patch("custom_components.casa.PrewarmListener") as mock_listener:
+             patch("custom_components.casa.SessionRegistrationListener") as mock_listener:
             client_inst = MagicMock()
             client_inst.health_check = AsyncMock(return_value=True)
             client_inst.close = AsyncMock()

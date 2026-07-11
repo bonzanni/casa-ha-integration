@@ -19,7 +19,7 @@ from .const import (
     CONF_HOST, CONF_PORT, CONF_TRANSPORT, CONF_WEBHOOK_SECRET,
     DEFAULT_TRANSPORT,
 )
-from .prewarm import PrewarmListener
+from .registration import SessionRegistrationListener
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -29,7 +29,7 @@ PLATFORMS = [Platform.CONVERSATION]
 @dataclass
 class CasaRuntimeData:
     client: CasaApiClient
-    listener: PrewarmListener
+    listener: SessionRegistrationListener
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
@@ -50,7 +50,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         raise ConfigEntryNotReady("Casa health check failed")
 
     transport = entry.options.get(CONF_TRANSPORT, DEFAULT_TRANSPORT)
-    listener = PrewarmListener(hass, client, transport)
+    listener = SessionRegistrationListener(hass, client, transport)
     listener.attach()
 
     entry.runtime_data = CasaRuntimeData(client=client, listener=listener)

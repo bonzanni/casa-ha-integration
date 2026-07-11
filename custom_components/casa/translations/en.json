@@ -36,7 +36,7 @@
         "data_description": {
           "agent_role": "Which Casa agent handles conversations (e.g. 'butler', 'assistant')",
           "session_mode": "How memory scope is derived: per device, per user, or per conversation",
-          "transport": "Prefer WebSocket (enables prewarm and barge-in) or SSE (stateless fallback)"
+          "transport": "Prefer WebSocket (enables barge-in and voice session registration) or SSE (stateless fallback)"
         }
       }
     }

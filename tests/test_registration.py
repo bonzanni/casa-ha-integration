@@ -1,4 +1,4 @@
-"""Tests for the assist_satellite state-listener prewarm."""
+"""Tests for the assist_satellite state-listener session registration."""
 
 from __future__ import annotations
 
@@ -6,7 +6,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from custom_components.casa.prewarm import PrewarmListener
+from custom_components.casa.registration import SessionRegistrationListener
 from custom_components.casa.const import TRANSPORT_WS, TRANSPORT_SSE
 
 
@@ -20,28 +20,46 @@ def _state_change_event(entity_id: str, new_state_state: str, domain: str = "ass
     return ev
 
 
-class TestPrewarmListener:
+class TestSessionRegistrationListener:
+    def test_attach_tracks_assist_satellite_domain(self):
+        from homeassistant.helpers import event as ha_event
+
+        ha_event.async_track_state_change_filtered.reset_mock()
+        listener = SessionRegistrationListener(MagicMock(), MagicMock(), TRANSPORT_WS)
+        listener.attach()
+
+        args = ha_event.async_track_state_change_filtered.call_args[0]
+        track_states = args[1]
+        assert track_states.all_states is False
+        assert track_states.entities == set()
+        assert track_states.domains == {"assist_satellite"}
+        assert args[2] == listener.handle
+
+        tracker = ha_event.async_track_state_change_filtered.return_value
+        listener.detach()
+        tracker.async_remove.assert_called_once()
+
     @pytest.mark.asyncio
-    async def test_listening_fires_prewarm_with_device_id(self):
+    async def test_listening_registers_session_with_device_id(self):
         hass = MagicMock()
         hass.async_create_task = MagicMock()
 
         client = MagicMock()
-        client.prewarm = AsyncMock()
+        client.register_session = AsyncMock()
 
         from homeassistant.helpers import entity_registry as er
         entity_entry = MagicMock()
         entity_entry.device_id = "dev-kitchen"
         er.async_get = MagicMock(return_value=MagicMock(async_get=lambda _id: entity_entry))
 
-        listener = PrewarmListener(hass, client, TRANSPORT_WS)
+        listener = SessionRegistrationListener(hass, client, TRANSPORT_WS)
         listener.handle(_state_change_event("assist_satellite.kitchen", "listening"))
 
         # The coroutine should be submitted via async_create_task.
         hass.async_create_task.assert_called_once()
         coro = hass.async_create_task.call_args[0][0]
         await coro
-        client.prewarm.assert_awaited_once_with(scope_id="dev-kitchen", transport=TRANSPORT_WS)
+        client.register_session.assert_awaited_once_with(scope_id="dev-kitchen", transport=TRANSPORT_WS)
 
     @pytest.mark.asyncio
     async def test_ignores_non_listening_states(self):
@@ -49,7 +67,7 @@ class TestPrewarmListener:
         hass.async_create_task = MagicMock()
         client = MagicMock()
 
-        listener = PrewarmListener(hass, client, TRANSPORT_WS)
+        listener = SessionRegistrationListener(hass, client, TRANSPORT_WS)
         listener.handle(_state_change_event("assist_satellite.kitchen", "idle"))
         listener.handle(_state_change_event("assist_satellite.kitchen", "processing"))
         hass.async_create_task.assert_not_called()
@@ -60,7 +78,7 @@ class TestPrewarmListener:
         hass.async_create_task = MagicMock()
         client = MagicMock()
 
-        listener = PrewarmListener(hass, client, TRANSPORT_WS)
+        listener = SessionRegistrationListener(hass, client, TRANSPORT_WS)
         listener.handle(_state_change_event("light.kitchen", "listening", domain="light"))
         hass.async_create_task.assert_not_called()
 
@@ -69,14 +87,14 @@ class TestPrewarmListener:
         hass = MagicMock()
         hass.async_create_task = MagicMock()
         client = MagicMock()
-        client.prewarm = AsyncMock()
+        client.register_session = AsyncMock()
 
         from homeassistant.helpers import entity_registry as er
         entity_entry = MagicMock()
         entity_entry.device_id = "dev-kitchen"
         er.async_get = MagicMock(return_value=MagicMock(async_get=lambda _id: entity_entry))
 
-        listener = PrewarmListener(hass, client, TRANSPORT_SSE)
+        listener = SessionRegistrationListener(hass, client, TRANSPORT_SSE)
         listener.handle(_state_change_event("assist_satellite.kitchen", "listening"))
         hass.async_create_task.assert_not_called()
 
@@ -91,6 +109,6 @@ class TestPrewarmListener:
         entity_entry.device_id = None
         er.async_get = MagicMock(return_value=MagicMock(async_get=lambda _id: entity_entry))
 
-        listener = PrewarmListener(hass, client, TRANSPORT_WS)
+        listener = SessionRegistrationListener(hass, client, TRANSPORT_WS)
         listener.handle(_state_change_event("assist_satellite.kitchen", "listening"))
         hass.async_create_task.assert_not_called()

@@ -1,16 +1,27 @@
 {
-  "domain": "casa",
-  "name": "Casa",
-  "after_dependencies": ["assist_pipeline", "intent", "hassio", "assist_satellite"],
-  "codeowners": ["@bonzanni"],
+  "after_dependencies": [
+    "assist_pipeline",
+    "intent",
+    "hassio",
+    "assist_satellite"
+  ],
+  "codeowners": [
+    "@bonzanni"
+  ],
   "config_flow": true,
-  "dependencies": ["conversation"],
+  "dependencies": [
+    "conversation"
+  ],
   "documentation": "https://github.com/bonzanni/casa-ha-integration",
+  "domain": "casa",
   "integration_type": "service",
   "iot_class": "local_polling",
   "issue_tracker": "https://github.com/bonzanni/casa-ha-integration/issues",
-  "loggers": ["custom_components.casa"],
+  "loggers": [
+    "custom_components.casa"
+  ],
+  "name": "Casa",
   "quality_scale": "custom",
   "requirements": [],
-  "version": "0.1.0"
+  "version": "0.2.0"
 }

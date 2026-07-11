@@ -92,7 +92,7 @@ class TestHandleMessageHappy:
             BlockFrame(text=" world", final=True),
             DoneFrame(),
         ]))
-        ent._client.prewarm = AsyncMock()
+        ent._client.register_session = AsyncMock()
 
         ui = _input(device_id="d-1")
         chat_log = _ChatLogCapture()

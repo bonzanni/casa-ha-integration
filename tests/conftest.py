@@ -100,6 +100,15 @@ def _ensure_ha_stubs() -> None:
     ha_event = _make_stub_module("homeassistant.helpers.event")
     ha_event.async_track_state_change_event = MagicMock(return_value=lambda: None)
 
+    class _TrackStates:
+        def __init__(self, all_states, entities, domains):
+            self.all_states = all_states
+            self.entities = entities
+            self.domains = domains
+
+    ha_event.TrackStates = _TrackStates
+    ha_event.async_track_state_change_filtered = MagicMock(return_value=MagicMock())
+
     ha_er = _make_stub_module("homeassistant.helpers.entity_registry")
     ha_er.async_get = MagicMock(return_value=MagicMock())
 

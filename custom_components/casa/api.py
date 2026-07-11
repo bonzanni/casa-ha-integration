@@ -232,9 +232,14 @@ class CasaApiClient:
                     except Exception:
                         _LOGGER.debug("Cancel frame failed — connection likely closed", exc_info=True)
 
-    async def prewarm(self, scope_id: str, transport: str = "ws") -> None:
+    async def register_session(self, scope_id: str, transport: str = "ws") -> None:
+        """Send ``stt_start`` to register the voice scope for idle-sweep/dedup.
+
+        The add-on stopped prewarming memory on ``stt_start`` in 0.4x; this
+        frame now only ensures the session pool entry exists.
+        """
         if transport != "ws":
-            _LOGGER.debug("Prewarm requested on SSE transport — no-op")
+            _LOGGER.debug("Session registration requested on SSE transport — no-op")
             return
         ws = await self._ensure_ws()
         await ws.send_json({

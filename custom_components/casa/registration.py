@@ -1,4 +1,9 @@
-"""assist_satellite state-listener prewarm for Casa."""
+"""assist_satellite state-listener session registration for Casa.
+
+Sends an ``stt_start`` frame when a satellite starts listening. Since Casa
+0.4x this only registers the voice scope for idle-sweep/dedup on the add-on
+side — the add-on no longer prewarms the memory overlay on ``stt_start``.
+"""
 
 from __future__ import annotations
 
@@ -7,33 +12,33 @@ from typing import Any
 
 from homeassistant.core import callback
 from homeassistant.helpers import entity_registry as er
-from homeassistant.helpers.event import async_track_state_change_event
+from homeassistant.helpers.event import TrackStates, async_track_state_change_filtered
 
-from .const import TRANSPORT_SSE, TRANSPORT_WS
+from .const import TRANSPORT_SSE
 
 _LOGGER = logging.getLogger(__name__)
 
 
-class PrewarmListener:
-    """Fires Casa prewarm on every assist_satellite LISTENING transition."""
+class SessionRegistrationListener:
+    """Registers the Casa voice session on every assist_satellite LISTENING transition."""
 
     def __init__(self, hass: Any, client: Any, transport: str) -> None:
         self._hass = hass
         self._client = client
         self._transport = transport
         self._logged_sse_noop = False
-        self._unsub = None
+        self._tracker = None
 
     def attach(self) -> None:
-        """Subscribe to state changes. Returns a tear-down callable via detach()."""
-        self._unsub = async_track_state_change_event(
-            self._hass, "*", self.handle,
+        """Subscribe to assist_satellite state changes. Tear down via detach()."""
+        self._tracker = async_track_state_change_filtered(
+            self._hass, TrackStates(False, set(), {"assist_satellite"}), self.handle,
         )
 
     def detach(self) -> None:
-        if self._unsub is not None:
-            self._unsub()
-            self._unsub = None
+        if self._tracker is not None:
+            self._tracker.async_remove()
+            self._tracker = None
 
     @callback
     def handle(self, event: Any) -> None:
@@ -46,7 +51,7 @@ class PrewarmListener:
             return
         if self._transport == TRANSPORT_SSE:
             if not self._logged_sse_noop:
-                _LOGGER.debug("Prewarm listener active but transport=sse; skipping.")
+                _LOGGER.debug("Registration listener active but transport=sse; skipping.")
                 self._logged_sse_noop = True
             return
 
@@ -56,6 +61,7 @@ class PrewarmListener:
         if entry is None or entry.device_id is None:
             return
         scope_id = entry.device_id
+        _LOGGER.debug("Registering voice session scope=%s", scope_id)
         self._hass.async_create_task(
-            self._client.prewarm(scope_id=scope_id, transport=self._transport)
+            self._client.register_session(scope_id=scope_id, transport=self._transport)
         )
