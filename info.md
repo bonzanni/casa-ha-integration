@@ -1,7 +1,7 @@
 # Casa
 
 Casa is the Home Assistant companion integration for the Casa add-on. Version
-0.4.0 connects one Casa parent to the server's authenticated voice-agent catalog
+0.5.0 connects one Casa parent to the server's authenticated voice-agent catalog
 and creates separate conversation entities for Tina, Gary, and future agents.
 Each child keeps a fixed catalog role and its own client, connection,
 availability, session, background route, and cleanup lifecycle; a missing or

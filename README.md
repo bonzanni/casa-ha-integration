@@ -1,7 +1,7 @@
 # Casa HA Integration
 
 Companion custom integration that connects Home Assistant to the
-[Casa add-on](https://github.com/bonzanni/casa-ha-app). Integration v0.4.0
+[Casa add-on](https://github.com/bonzanni/casa-ha-app). Integration v0.5.0
 creates one Casa parent from the server's authenticated voice-agent catalog,
 then exposes separate conversation entities for Tina, Gary, and future
 catalog-discovered agents. Each entity has its own routing, connection,
@@ -137,7 +137,7 @@ being silently lost.
 ## Release acceptance
 
 Release acceptance has two layers: reproducible real-system exercises and
-automated fault-injection gates. Both must pass before publishing v0.4.0.
+automated fault-injection gates. Both must pass before publishing v0.5.0.
 
 ### Real-system E2E
 
