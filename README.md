@@ -62,9 +62,9 @@ connection on a trusted LAN, private network, or encrypted tunnel.
    → Voice** for direct home-control turns, **Casa Concierge → Voice** for
    concierge/specialist work, or the relevant future catalog role.
 
-There is no agent role field. Roles and display names come from Casa and remain
-fixed for each discovered child, so a pipeline cannot silently reroute to a
-different agent.
+There is no agent role field. The catalog role remains fixed for each discovered
+child, so a pipeline cannot silently reroute to a different agent; its mutable
+persona alias is descriptive metadata only.
 
 Manual setup rejects another entry with the exact host and port. The Casa
 Supervisor UUID remains authoritative when Supervisor discovery is available;
