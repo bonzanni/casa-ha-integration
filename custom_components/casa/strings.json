@@ -30,15 +30,23 @@
       "init": {
         "data": {
           "agent_role": "Agent role",
+          "idle_stability_ms": "Assist idle stability (milliseconds)",
+          "satellite_entity_overrides": "Satellite entity overrides (JSON)",
           "session_mode": "Session scope",
           "transport": "Transport"
         },
         "data_description": {
           "agent_role": "Which Casa agent handles conversations (e.g. 'butler', 'assistant')",
+          "idle_stability_ms": "Debounces brief Assist follow-up gaps before an announcement (0–5000 ms). A device that is already stably idle is not delayed.",
+          "satellite_entity_overrides": "Optional JSON object mapping Home Assistant device IDs to assist_satellite entity IDs when a device has multiple satellites.",
           "session_mode": "How memory scope is derived: per device, per user, or per conversation",
           "transport": "Prefer WebSocket (enables barge-in and voice session registration) or SSE (stateless fallback)"
         }
       }
+    },
+    "error": {
+      "invalid_idle_stability": "Enter a whole number from 0 to 5000.",
+      "invalid_satellite_entity_overrides": "Enter a JSON object whose assist_satellite entities are currently bound to the matching device IDs."
     }
   }
 }

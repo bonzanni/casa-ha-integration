@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from typing import Any
 
@@ -14,18 +15,22 @@ from homeassistant.config_entries import (
 )
 from homeassistant.core import callback
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
+from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.service_info.hassio import HassioServiceInfo
 
 from .api import AuthenticationError, CasaApiClient
 from .const import (
-    CONF_AGENT_ROLE, CONF_HOST, CONF_PORT, CONF_SESSION_MODE,
+    CONF_AGENT_ROLE, CONF_HOST, CONF_IDLE_STABILITY_MS, CONF_PORT,
+    CONF_SATELLITE_ENTITY_OVERRIDES, CONF_SESSION_MODE,
     CONF_TRANSPORT, CONF_WEBHOOK_SECRET, DEFAULT_AGENT_ROLE,
-    DEFAULT_PORT, DEFAULT_SESSION_MODE, DEFAULT_TRANSPORT, DOMAIN,
+    DEFAULT_IDLE_STABILITY_MS, DEFAULT_PORT, DEFAULT_SATELLITE_ENTITY_OVERRIDES,
+    DEFAULT_SESSION_MODE, DEFAULT_TRANSPORT, DOMAIN,
     SESSION_MODE_CONVERSATION, SESSION_MODE_DEVICE, SESSION_MODE_USER,
     TRANSPORT_SSE, TRANSPORT_WS,
 )
 
 _LOGGER = logging.getLogger(__name__)
+_sleep = asyncio.sleep
 
 USER_SCHEMA = vol.Schema({
     vol.Required(CONF_HOST, default="localhost"): str,
@@ -36,6 +41,33 @@ USER_SCHEMA = vol.Schema({
 REAUTH_SCHEMA = vol.Schema({
     vol.Required(CONF_WEBHOOK_SECRET): str,
 })
+
+
+def _canonical_satellite_overrides(hass: Any, raw: Any) -> str:
+    """Validate exact current registry bindings and return compact JSON."""
+    if not isinstance(raw, str):
+        raise ValueError
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError as err:
+        raise ValueError from err
+    if not isinstance(parsed, dict):
+        raise ValueError
+    if not parsed:
+        return DEFAULT_SATELLITE_ENTITY_OVERRIDES
+    registry = er.async_get(hass)
+    for device_id, entity_id in parsed.items():
+        if (
+            not isinstance(device_id, str)
+            or not device_id
+            or not isinstance(entity_id, str)
+            or not entity_id.startswith("assist_satellite.")
+        ):
+            raise ValueError
+        entry = registry.async_get(entity_id)
+        if entry is None or entry.device_id != device_id:
+            raise ValueError
+    return json.dumps(parsed, sort_keys=True, separators=(",", ":"))
 
 
 async def _validate_connection(hass, data: dict) -> None:
@@ -68,7 +100,7 @@ class CasaConfigFlow(ConfigFlow, domain=DOMAIN):
             except (aiohttp.ClientError, asyncio.TimeoutError):
                 errors["base"] = "cannot_connect"
             except Exception:
-                _LOGGER.exception("Unexpected Casa setup error")
+                _LOGGER.error("Casa setup state=failed reason=unexpected")
                 errors["base"] = "unknown"
             else:
                 return self.async_create_entry(title="Casa", data=user_input)
@@ -114,7 +146,7 @@ class CasaConfigFlow(ConfigFlow, domain=DOMAIN):
                 except (aiohttp.ClientError, asyncio.TimeoutError) as err:
                     last_error = err
                     if attempt < 2:
-                        await asyncio.sleep(2)
+                        await _sleep(2)
             if last_error is not None:
                 errors["base"] = "cannot_connect"
             else:
@@ -170,14 +202,50 @@ class CasaConfigFlow(ConfigFlow, domain=DOMAIN):
 
 class CasaOptionsFlow(OptionsFlow):
     async def async_step_init(self, user_input: dict | None = None) -> ConfigFlowResult:
+        errors: dict[str, str] = {}
         if user_input is not None:
-            return self.async_create_entry(data=user_input)
+            data = dict(user_input)
+            stability_ms = data.get(
+                CONF_IDLE_STABILITY_MS,
+                DEFAULT_IDLE_STABILITY_MS,
+            )
+            if (
+                type(stability_ms) is not int
+                or not 0 <= stability_ms <= 5000
+            ):
+                errors[CONF_IDLE_STABILITY_MS] = "invalid_idle_stability"
+            else:
+                data[CONF_IDLE_STABILITY_MS] = stability_ms
+            try:
+                data[CONF_SATELLITE_ENTITY_OVERRIDES] = (
+                    _canonical_satellite_overrides(
+                        self.hass,
+                        data.get(
+                            CONF_SATELLITE_ENTITY_OVERRIDES,
+                            DEFAULT_SATELLITE_ENTITY_OVERRIDES,
+                        ),
+                    )
+                )
+            except ValueError:
+                errors[CONF_SATELLITE_ENTITY_OVERRIDES] = (
+                    "invalid_satellite_entity_overrides"
+                )
+            if not errors:
+                return self.async_create_entry(data=data)
 
         return self.async_show_form(
             step_id="init",
             data_schema=self.add_suggested_values_to_schema(
                 vol.Schema({
                     vol.Optional(CONF_AGENT_ROLE, default=DEFAULT_AGENT_ROLE): str,
+                    vol.Optional(
+                        CONF_IDLE_STABILITY_MS,
+                        default=DEFAULT_IDLE_STABILITY_MS,
+                    ): vol.All(int, vol.Range(min=0, max=5000)),
+                    vol.Optional(
+                        CONF_SATELLITE_ENTITY_OVERRIDES,
+                        default=DEFAULT_SATELLITE_ENTITY_OVERRIDES,
+                    ): str,
                     vol.Optional(CONF_SESSION_MODE, default=DEFAULT_SESSION_MODE):
                         vol.In({
                             SESSION_MODE_DEVICE: "Per device",
@@ -187,6 +255,7 @@ class CasaOptionsFlow(OptionsFlow):
                     vol.Optional(CONF_TRANSPORT, default=DEFAULT_TRANSPORT):
                         vol.In({TRANSPORT_WS: "WebSocket", TRANSPORT_SSE: "SSE"}),
                 }),
-                self.config_entry.options,
+                user_input if user_input is not None else self.config_entry.options,
             ),
+            errors=errors,
         )

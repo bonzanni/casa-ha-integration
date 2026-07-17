@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import sys
 import types
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -65,6 +65,7 @@ def _ensure_ha_stubs() -> None:
 
     class _OptionsFlow:
         def __init__(self):
+            self.hass = None
             self.config_entry = MagicMock()
             self.config_entry.options = {}
 
