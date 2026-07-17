@@ -79,12 +79,12 @@ retained.
 
 ### Stable Home Assistant names
 
-Home Assistant uses stable role identity rather than configurable Casa persona
+Home Assistant uses stable role identity rather than mutable catalog persona
 aliases. The integration parent is **Casa**; each discovered role has a device
 named **Casa &lt;Role&gt;** and one conversation entity named **Voice**. For example,
 Assist shows **Casa Butler → Voice** and **Casa Concierge → Voice**. Casa may
-configure those personas as Tina, Gary, or other names, but those names appear
-only as descriptive device metadata and never become pipeline-service identity.
+change those persona aliases (Tina, Gary, or other names), but they remain
+descriptive device metadata and never become pipeline-service identity.
 
 ## Options and agent settings
 

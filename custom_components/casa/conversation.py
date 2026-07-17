@@ -45,7 +45,7 @@ def _ha_context_payload(user_input: conversation.ConversationInput) -> dict:
 
 
 class CasaConversationEntity(conversation.ConversationEntity):
-    _attr_has_entity_name = False
+    _attr_has_entity_name = True
     _attr_supports_streaming = True
 
     def __init__(

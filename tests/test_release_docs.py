@@ -71,6 +71,8 @@ def test_readme_documents_catalog_parent_and_agent_children():
     assert "matching discovered role" in text
     assert "Casa Butler → Voice" in text
     assert "Casa Concierge → Voice" in text
+    assert "stable role identity" in text
+    assert "mutable catalog persona aliases" in text
 
 
 def test_readme_documents_parent_and_child_configuration_boundaries():

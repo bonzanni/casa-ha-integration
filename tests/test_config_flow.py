@@ -89,7 +89,7 @@ def _agent_subentry() -> ConfigSubentry:
             CONF_IDLE_STABILITY_MS: DEFAULT_IDLE_STABILITY_MS,
         }),
         subentry_type=SUBENTRY_TYPE_AGENT,
-        title="Gary",
+        title="Concierge",
         unique_id="concierge",
         subentry_id="gary-subentry",
     )
@@ -740,7 +740,7 @@ class TestAgentSubentryFlow:
             CONF_IDLE_STABILITY_MS: 1250,
         }
         assert child.unique_id == "concierge"
-        assert child.title == "Gary"
+        assert child.title == "Concierge"
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("stability_ms", [True, -1, 5001])
@@ -773,10 +773,10 @@ PARENT_OVERRIDE_DESCRIPTION = (
     "an ambiguous announcement rather than speaking on the wrong device."
 )
 CHILD_IDLE_DESCRIPTION = (
-    "How long Casa waits after the voice assistant becomes idle before speaking "
-    "a queued specialist result. This prevents Gary from interrupting an active "
-    "conversation or follow-up. If the device is already idle, the result is "
-    "spoken immediately. Default: 750 ms."
+    "After a queued result is ready, Casa waits only if the Assist satellite is "
+    "still busy. If it is already idle, Casa speaks immediately. Once the "
+    "satellite becomes idle, it waits this long to let brief follow-ups settle. "
+    "Default: 750 ms."
 )
 
 
