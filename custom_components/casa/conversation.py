@@ -17,7 +17,7 @@ from homeassistant.const import MATCH_ALL
 from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers import intent
 
-from .api import AuthenticationError, BlockFrame, DoneFrame, ErrorFrame
+from .api import AuthenticationError, BlockFrame, ErrorFrame
 from .const import (
     CONF_AGENT_ROLE, CONF_SESSION_MODE, CONF_TRANSPORT,
     DEFAULT_AGENT_ROLE, DEFAULT_SESSION_MODE, DEFAULT_TRANSPORT,

@@ -4,9 +4,50 @@ from __future__ import annotations
 
 import sys
 import types
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import MagicMock
 
 import pytest
+
+
+HA_STUB_EXPORTS = frozenset({
+    "homeassistant.core:callback", "homeassistant.core:HomeAssistant",
+    "homeassistant.core:Event", "homeassistant.core:EventStateChangedData",
+    "homeassistant.config_entries:ConfigFlow",
+    "homeassistant.config_entries:OptionsFlow",
+    "homeassistant.config_entries:ConfigEntry",
+    "homeassistant.config_entries:ConfigFlowResult",
+    "homeassistant.const:Platform", "homeassistant.const:MATCH_ALL",
+    "homeassistant.const:EVENT_STATE_CHANGED",
+    "homeassistant.exceptions:ConfigEntryAuthFailed",
+    "homeassistant.exceptions:ConfigEntryNotReady",
+    "homeassistant.helpers.aiohttp_client:async_get_clientsession",
+    "homeassistant.helpers.event:async_track_state_change_event",
+    "homeassistant.helpers.event:TrackStates",
+    "homeassistant.helpers.event:async_track_state_change_filtered",
+    "homeassistant.helpers.entity_registry:EVENT_ENTITY_REGISTRY_UPDATED",
+    "homeassistant.helpers.entity_registry:async_get",
+    "homeassistant.helpers.service_info.hassio:HassioServiceInfo",
+    "homeassistant.helpers.device_registry:DeviceInfo",
+    "homeassistant.helpers.device_registry:DeviceEntryType",
+    "homeassistant.helpers.intent:IntentResponse",
+    "homeassistant.helpers.intent:IntentResponseErrorCode",
+    "homeassistant.components.conversation:ConversationEntity",
+    "homeassistant.components.conversation:ConversationInput",
+    "homeassistant.components.conversation:ConversationResult",
+    "homeassistant.components.conversation:ChatLog",
+    "homeassistant.components.conversation:async_get_result_from_chat_log",
+    "homeassistant.components.conversation.chat_log:ChatLog",
+    "homeassistant.components.assist_satellite:AssistSatelliteState",
+    "homeassistant:core", "homeassistant:config_entries",
+    "homeassistant:const", "homeassistant:exceptions", "homeassistant:helpers",
+    "homeassistant:components", "homeassistant.helpers:aiohttp_client",
+    "homeassistant.helpers:event", "homeassistant.helpers:entity_registry",
+    "homeassistant.helpers:service_info",
+    "homeassistant.helpers:device_registry", "homeassistant.helpers:intent",
+    "homeassistant.helpers.service_info:hassio",
+    "homeassistant.components:conversation",
+    "homeassistant.components:assist_satellite",
+})
 
 
 def _make_stub_module(name: str) -> types.ModuleType:
@@ -65,6 +106,7 @@ def _ensure_ha_stubs() -> None:
 
     class _OptionsFlow:
         def __init__(self):
+            self.hass = None
             self.config_entry = MagicMock()
             self.config_entry.options = {}
 
@@ -110,6 +152,7 @@ def _ensure_ha_stubs() -> None:
     ha_event.async_track_state_change_filtered = MagicMock(return_value=MagicMock())
 
     ha_er = _make_stub_module("homeassistant.helpers.entity_registry")
+    ha_er.EVENT_ENTITY_REGISTRY_UPDATED = "entity_registry_updated"
     ha_er.async_get = MagicMock(return_value=MagicMock())
 
     ha_si = _make_stub_module("homeassistant.helpers.service_info")
