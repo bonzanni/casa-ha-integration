@@ -1,7 +1,7 @@
 # Casa
 
 Casa is the Home Assistant companion integration for the Casa add-on. Version
-0.4.0 connects one Casa parent to the server's authenticated voice-agent catalog
+0.5.0 connects one Casa parent to the server's authenticated voice-agent catalog
 and creates separate conversation entities for Tina, Gary, and future agents.
 Each child keeps a fixed catalog role and its own client, connection,
 availability, session, background route, and cleanup lifecycle; a missing or
@@ -21,6 +21,15 @@ v0.4.0 is a clean break from v0.3.0. There is no automatic migration: note the
 current pipeline assignments, delete the existing Casa integration entry, add
 Casa again, and recreate affected Assist pipelines with the matching discovered
 agent.
+
+When Casa runs as a Supervisor app with webhook authentication enabled, Home
+Assistant discovers it automatically. Confirm the displayed host and port to
+connect; the versioned discovery record supplies the authenticated webhook
+secret. If discovery is unavailable, use **Settings → Devices & services → Add
+integration → Casa** and enter the exact host, port, and webhook secret
+manually. Rediscovery of the same Supervisor UUID updates the stored endpoint
+and secret, reloads the parent, and retains its Tina, Gary, and future
+voice-agent children.
 
 The parent Configure action contains only satellite entity overrides. Reconfigure
 each agent child to change session mode, WebSocket/SSE transport, or Assist idle

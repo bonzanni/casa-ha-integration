@@ -12,7 +12,7 @@
       },
       "hassio_confirm": {
         "title": "Casa add-on discovered",
-        "description": "Connect to {name}?"
+        "description": "Connect to {name} at {host}:{port}?"
       },
       "reauth_confirm": {
         "title": "Reauthenticate Casa",
@@ -29,6 +29,8 @@
     },
     "abort": {
       "already_configured": "Casa is already configured",
+      "invalid_discovery": "Casa supplied an invalid Supervisor discovery record.",
+      "discovery_updated": "Casa connection details updated.",
       "reauth_successful": "Re-authentication successful"
     }
   },

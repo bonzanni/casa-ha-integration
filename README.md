@@ -1,7 +1,7 @@
 # Casa HA Integration
 
 Companion custom integration that connects Home Assistant to the
-[Casa add-on](https://github.com/bonzanni/casa-ha-app). Integration v0.4.0
+[Casa add-on](https://github.com/bonzanni/casa-ha-app). Integration v0.5.0
 creates one Casa parent from the server's authenticated voice-agent catalog,
 then exposes separate conversation entities for Tina, Gary, and future
 catalog-discovered agents. Each entity has its own routing, connection,
@@ -50,10 +50,14 @@ connection on a trusted LAN, private network, or encrypted tunnel.
 3. Add `https://github.com/bonzanni/casa-ha-integration` with category
    **Integration**.
 4. Install **Casa**, then restart Home Assistant.
-5. Go to **Settings → Devices & services → Add integration → Casa**.
-6. Enter the exact host, port (default `18065`), and Casa webhook secret. Setup
-   authenticates and validates the complete catalog before creating one parent
-   plus its voice-agent children.
+5. When Casa is running as a Supervisor app with webhook authentication enabled,
+   Home Assistant discovers it automatically. Confirm the displayed host and
+   port before connecting; the discovery record carries the authenticated
+   webhook secret and creates one parent plus its voice-agent children.
+6. If automatic discovery is unavailable, go to **Settings → Devices & services
+   → Add integration → Casa** and enter the exact host, port (default `18065`),
+   and Casa webhook secret. Manual setup authenticates and validates the same
+   complete catalog.
 7. In each Assist pipeline, select the matching discovered agent: Tina for
    direct butler turns, Gary for concierge/specialist work, or the relevant
    future catalog agent.
@@ -66,6 +70,11 @@ Manual setup rejects another entry with the exact host and port. The Casa
 Supervisor UUID remains authoritative when Supervisor discovery is available;
 manual setup cannot prove that different aliases for the same host identify the
 same installation, so alias-based duplicates remain possible.
+
+Casa publishes a strict, versioned Supervisor discovery record only while
+webhook authentication is enabled. On a later discovery for the same Supervisor
+UUID, Casa updates the stored endpoint and webhook secret and reloads the
+existing parent; its Tina, Gary, and future voice-agent children are retained.
 
 ## Options and agent settings
 
@@ -128,7 +137,7 @@ being silently lost.
 ## Release acceptance
 
 Release acceptance has two layers: reproducible real-system exercises and
-automated fault-injection gates. Both must pass before publishing v0.4.0.
+automated fault-injection gates. Both must pass before publishing v0.5.0.
 
 ### Real-system E2E
 
