@@ -461,6 +461,37 @@ class TestBackgroundDelivery:
         await client.close()
 
     @pytest.mark.asyncio
+    async def test_old_casa_no_ack_rejects_job_frames(self):
+        session = MagicMock()
+        ws = _FakeWS(stay_open=True)
+        session.ws_connect = AsyncMock(return_value=ws)
+        client = CasaApiClient(session=session, host="h", port=1, webhook_secret="sec")
+        frame = {
+            "type": "job_claimed",
+            "protocol": 1,
+            "job_id": "job-1",
+            "delivery_attempt_id": "attempt-1",
+        }
+
+        try:
+            await client.start_background(
+                route_id="entry-1", agent_role="concierge", job_handler=AsyncMock(),
+            )
+
+            with pytest.raises(ConnectionError, match="background protocol"):
+                await client.send_job_frame(frame)
+
+            assert ws.sent == [{
+                "type": "voice_route_register",
+                "protocol": 1,
+                "route_id": "entry-1",
+                "agent_role": "concierge",
+                "capabilities": ["background_jobs", "satellite_announce"],
+            }]
+        finally:
+            await client.close()
+
+    @pytest.mark.asyncio
     @pytest.mark.parametrize(
         ("ack", "expected"),
         [
@@ -600,11 +631,16 @@ class TestBackgroundDelivery:
         ws = _FakeWS(stay_open=True)
         session.ws_connect = AsyncMock(return_value=ws)
         handler_called = asyncio.Event()
-        sensitive = "private spoken result"
+        exception_canary = "SECRET_EXCEPTION_CANARY_8e3cf1"
+        frame_type_canary = "job_ready_SECRET_FRAME_TYPE_CANARY_17d21a"
+        job_id_canary = "SECRET_JOB_ID_CANARY_f89b04"
+        attempt_id_canary = "SECRET_ATTEMPT_ID_CANARY_c7c32a"
+        result_canary = "SECRET_RESULT_CANARY_00ce11"
+        spoken_canary = "SECRET_SPOKEN_CANARY_956eab"
 
         async def handler(_frame):
             handler_called.set()
-            raise RuntimeError(sensitive)
+            raise RuntimeError(exception_canary)
 
         client = CasaApiClient(session=session, host="h", port=1, webhook_secret="sec")
         await client.start_background(
@@ -617,16 +653,26 @@ class TestBackgroundDelivery:
         })
         await _wait_until(lambda: client.background_capable)
         ws.feed_json({
-            "type": "job_ready",
+            "type": frame_type_canary,
             "protocol": 1,
-            "job_id": "job-1",
-            "delivery_attempt_id": "attempt-1",
+            "job_id": job_id_canary,
+            "delivery_attempt_id": attempt_id_canary,
+            "result": result_canary,
+            "spoken": spoken_canary,
         })
         await asyncio.wait_for(handler_called.wait(), timeout=1)
         await _wait_until(lambda: bool(caplog.records))
 
-        assert sensitive not in caplog.text
-        assert "job_ready" in caplog.text
+        assert "Background job frame handler failed" in caplog.text
+        for canary in (
+            exception_canary,
+            frame_type_canary,
+            job_id_canary,
+            attempt_id_canary,
+            result_canary,
+            spoken_canary,
+        ):
+            assert canary not in caplog.text
         await client.close()
 
     @pytest.mark.asyncio
@@ -680,6 +726,78 @@ class TestBackgroundDelivery:
         assert [frame["type"] for frame in second.sent] == ["voice_route_register"]
         assert client.reconnect_attempts_for_test == 1
         await client.close()
+
+    @pytest.mark.asyncio
+    async def test_job_send_rechecks_negotiation_after_reconnect(self):
+        session = MagicMock()
+        first = _FakeWS(stay_open=True)
+        second = _FakeWS(stay_open=True)
+        session.ws_connect = AsyncMock(side_effect=[first, second])
+        client = CasaApiClient(session=session, host="h", port=1, webhook_secret="sec")
+        send_entered_ensure = asyncio.Event()
+        release_ensure = asyncio.Event()
+        send_task = None
+        frame = {
+            "type": "job_claimed",
+            "protocol": 1,
+            "job_id": "job-1",
+            "delivery_attempt_id": "attempt-1",
+        }
+
+        try:
+            await client.start_background(
+                route_id="entry-1", agent_role="concierge", job_handler=AsyncMock(),
+            )
+            first.feed_json({
+                "type": "voice_route_registered",
+                "protocol": 1,
+                "accepted_capabilities": ["background_jobs", "satellite_announce"],
+            })
+            await _wait_until(lambda: client.background_capable)
+
+            original_ensure_ws = client._ensure_ws
+
+            async def ensure_after_generation_switch():
+                send_entered_ensure.set()
+                await release_ensure.wait()
+                return await original_ensure_ws()
+
+            client._ensure_ws = ensure_after_generation_switch
+            send_task = asyncio.create_task(client.send_job_frame(frame))
+            await asyncio.wait_for(send_entered_ensure.wait(), timeout=1)
+
+            first.closed = True
+            release_ensure.set()
+            with pytest.raises(ConnectionError, match="background protocol"):
+                await send_task
+
+            assert client.background_capable is False
+            assert [sent["type"] for sent in second.sent] == ["voice_route_register"]
+
+            second.feed_json({
+                "type": "voice_route_registered",
+                "protocol": 1,
+                "accepted_capabilities": ["background_jobs", "satellite_announce"],
+            })
+            await _wait_until(lambda: client.background_capable)
+            await client.send_job_frame(frame)
+
+            assert second.sent == [
+                {
+                    "type": "voice_route_register",
+                    "protocol": 1,
+                    "route_id": "entry-1",
+                    "agent_role": "concierge",
+                    "capabilities": ["background_jobs", "satellite_announce"],
+                },
+                frame,
+            ]
+        finally:
+            release_ensure.set()
+            if send_task is not None and not send_task.done():
+                send_task.cancel()
+                await asyncio.gather(send_task, return_exceptions=True)
+            await client.close()
 
     @pytest.mark.asyncio
     async def test_old_generation_closes_only_its_utterance_queues(self):

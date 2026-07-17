@@ -79,6 +79,7 @@ class CasaApiClient:
         self._route_agent_role: str | None = None
         self._registered_generation: int | None = None
         self._route_ack = asyncio.Event()
+        self._route_ack_generation: int | None = None
         self._accepted_capabilities: frozenset[str] = frozenset()
         self._job_handler: Callable[[dict], Awaitable[None]] | None = None
         self._closed = False
@@ -88,11 +89,13 @@ class CasaApiClient:
     def background_capable(self) -> bool:
         """Whether the current socket negotiated the background protocol."""
         ws = self._ws
+        generation = self._ws_generation
         return bool(
             not self._closed
             and ws is not None
             and not ws.closed
             and self._route_ack.is_set()
+            and self._route_ack_generation == generation
             and frozenset(VOICE_ROUTE_CAPABILITIES) <= self._accepted_capabilities
         )
 
@@ -204,15 +207,20 @@ class CasaApiClient:
                 await ws.close()
                 raise RuntimeError("Casa API client is closed")
 
-            self._ws = ws
-            self._ws_generation += 1
-            generation = self._ws_generation
-            self._ws_backoff = WS_RECONNECT_MIN
-            self._registered_generation = None
-            self._route_ack.clear()
-            self._accepted_capabilities = frozenset()
-            reader = asyncio.create_task(self._read_loop(ws, generation))
-            self._ws_reader = reader
+            async with self._ws_write_lock:
+                if self._closed:
+                    await ws.close()
+                    raise RuntimeError("Casa API client is closed")
+                self._ws = ws
+                self._ws_generation += 1
+                generation = self._ws_generation
+                self._ws_backoff = WS_RECONNECT_MIN
+                self._registered_generation = None
+                self._route_ack.clear()
+                self._route_ack_generation = None
+                self._accepted_capabilities = frozenset()
+                reader = asyncio.create_task(self._read_loop(ws, generation))
+                self._ws_reader = reader
             try:
                 if self._route_id is not None:
                     await self._register_voice_route(ws, generation)
@@ -221,9 +229,13 @@ class CasaApiClient:
                 await asyncio.gather(reader, return_exceptions=True)
                 if not ws.closed:
                     await ws.close()
-                if self._ws is ws and self._ws_generation == generation:
-                    self._ws = None
-                    self._ws_reader = None
+                async with self._ws_write_lock:
+                    if self._ws is ws and self._ws_generation == generation:
+                        self._ws = None
+                        self._ws_reader = None
+                        self._route_ack.clear()
+                        self._route_ack_generation = None
+                        self._accepted_capabilities = frozenset()
                 raise
             return ws
 
@@ -233,6 +245,7 @@ class CasaApiClient:
         *,
         ws: aiohttp.ClientWebSocketResponse | None = None,
         generation: int | None = None,
+        require_background: bool = False,
     ) -> None:
         """Send through the sole writer after checking socket generation."""
         if ws is None:
@@ -248,6 +261,15 @@ class CasaApiClient:
                 or ws.closed
             ):
                 raise ConnectionError("Casa WebSocket generation is no longer active")
+            if require_background and (
+                not self._route_ack.is_set()
+                or self._route_ack_generation != generation
+                or frozenset(VOICE_ROUTE_CAPABILITIES)
+                - self._accepted_capabilities
+            ):
+                raise ConnectionError(
+                    "Casa background protocol is not negotiated for this generation",
+                )
             await ws.send_json(frame)
 
     async def _register_voice_route(
@@ -316,7 +338,7 @@ class CasaApiClient:
                     continue
                 frame_type = frame.get("type")
                 if frame_type == "voice_route_registered":
-                    self._handle_route_ack(frame, ws, generation)
+                    await self._handle_route_ack(frame, ws, generation)
                     continue
                 if isinstance(frame_type, str) and frame_type.startswith("job_"):
                     if self.background_capable and self._job_handler is not None:
@@ -325,10 +347,7 @@ class CasaApiClient:
                         except asyncio.CancelledError:
                             raise
                         except Exception:
-                            _LOGGER.error(
-                                "Background job frame handler failed type=%s",
-                                frame_type,
-                            )
+                            _LOGGER.error("Background job frame handler failed")
                     continue
                 uid = frame.get("utterance_id")
                 queue = self._ws_queues.get((generation, uid)) if uid else None
@@ -336,33 +355,37 @@ class CasaApiClient:
                     continue
                 await queue.put(frame)
         finally:
-            if self._ws is ws and self._ws_generation == generation:
-                self._ws = None
-                self._route_ack.clear()
-                self._accepted_capabilities = frozenset()
+            async with self._ws_write_lock:
+                if self._ws is ws and self._ws_generation == generation:
+                    self._ws = None
+                    self._route_ack.clear()
+                    self._route_ack_generation = None
+                    self._accepted_capabilities = frozenset()
             for (queue_generation, _), queue in list(self._ws_queues.items()):
                 if queue_generation == generation:
                     await queue.put({"type": "__closed__"})
 
-    def _handle_route_ack(
+    async def _handle_route_ack(
         self,
         frame: dict,
         ws: aiohttp.ClientWebSocketResponse,
         generation: int,
     ) -> None:
-        if self._ws is not ws or self._ws_generation != generation:
-            return
-        accepted = frame.get("accepted_capabilities")
-        if (
-            type(frame.get("protocol")) is int
-            and frame["protocol"] == VOICE_ROUTE_PROTOCOL
-            and isinstance(accepted, (list, tuple, set, frozenset))
-            and all(isinstance(capability, str) for capability in accepted)
-        ):
-            self._accepted_capabilities = frozenset(accepted)
-        else:
-            self._accepted_capabilities = frozenset()
-        self._route_ack.set()
+        async with self._ws_write_lock:
+            if self._ws is not ws or self._ws_generation != generation or ws.closed:
+                return
+            accepted = frame.get("accepted_capabilities")
+            if (
+                type(frame.get("protocol")) is int
+                and frame["protocol"] == VOICE_ROUTE_PROTOCOL
+                and isinstance(accepted, (list, tuple, set, frozenset))
+                and all(isinstance(capability, str) for capability in accepted)
+            ):
+                self._accepted_capabilities = frozenset(accepted)
+            else:
+                self._accepted_capabilities = frozenset()
+            self._route_ack_generation = generation
+            self._route_ack.set()
 
     async def _stream_utterance_ws(
         self, *, text, agent_role, scope_id, utterance_id, context,
@@ -431,7 +454,7 @@ class CasaApiClient:
 
     async def send_job_frame(self, frame: dict) -> None:
         """Send a background-delivery frame through the global WS writer."""
-        await self._send_json(frame)
+        await self._send_json(frame, require_background=True)
 
     async def register_session(
         self,
@@ -476,16 +499,18 @@ class CasaApiClient:
             *(task for task in tasks if task is not current),
             return_exceptions=True,
         )
-        if ws is not None and not ws.closed:
-            await ws.close()
+        async with self._ws_write_lock:
+            if ws is not None and not ws.closed:
+                await ws.close()
+            self._ws = None
+            self._ws_reader = None
+            self._ws_supervisor = None
+            self._registered_generation = None
+            self._route_ack.clear()
+            self._route_ack_generation = None
+            self._accepted_capabilities = frozenset()
         for queue in list(self._ws_queues.values()):
             await queue.put({"type": "__closed__"})
-        self._ws = None
-        self._ws_reader = None
-        self._ws_supervisor = None
-        self._registered_generation = None
-        self._route_ack.clear()
-        self._accepted_capabilities = frozenset()
 
     async def probe_auth(self) -> None:
         """Verify the webhook secret by sending an HMAC-signed empty-prompt POST.
