@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
@@ -138,3 +139,28 @@ async def test_serialized_diagnostics_excludes_every_sensitive_canary():
         "PRIVATE_RESULT_CANARY",
     ):
         assert canary not in serialized
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("include_runtime_attribute", [False, True])
+async def test_unloaded_diagnostics_are_empty_and_redacted(
+    include_runtime_attribute,
+):
+    fields = {
+        "data": {
+            "host": "PRIVATE_UNLOADED_HOST_CANARY",
+            "webhook_secret": "PRIVATE_UNLOADED_SECRET_CANARY",
+        },
+        "options": {"prompt": "PRIVATE_UNLOADED_PROMPT_CANARY"},
+    }
+    if include_runtime_attribute:
+        fields["runtime_data"] = None
+    entry = SimpleNamespace(**fields)
+
+    result = await async_get_config_entry_diagnostics(MagicMock(), entry)
+
+    assert result == {"catalog_healthy": False, "agents": []}
+    serialized = json.dumps(result)
+    assert "PRIVATE_UNLOADED_HOST_CANARY" not in serialized
+    assert "PRIVATE_UNLOADED_SECRET_CANARY" not in serialized
+    assert "PRIVATE_UNLOADED_PROMPT_CANARY" not in serialized

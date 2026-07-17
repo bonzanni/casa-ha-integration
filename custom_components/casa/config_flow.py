@@ -284,12 +284,25 @@ class CasaConfigFlow(ConfigFlow, domain=DOMAIN):
                 _LOGGER.error("Casa reauth state=failed reason=unexpected")
                 errors["base"] = "unknown"
             else:
-                return self.async_update_and_abort(
-                    reauth_entry,
-                    data_updates={
-                        CONF_WEBHOOK_SECRET: user_input[CONF_WEBHOOK_SECRET],
-                    },
+                secret = user_input[CONF_WEBHOOK_SECRET]
+                updates = {CONF_WEBHOOK_SECRET: secret}
+                if not reauth_entry.update_listeners:
+                    return self.async_update_reload_and_abort(
+                        reauth_entry,
+                        data_updates=updates,
+                    )
+                unchanged = (
+                    reauth_entry.data.get(CONF_WEBHOOK_SECRET) == secret
                 )
+                result = self.async_update_and_abort(
+                    reauth_entry,
+                    data_updates=updates,
+                )
+                if unchanged:
+                    self.hass.config_entries.async_schedule_reload(
+                        reauth_entry.entry_id,
+                    )
+                return result
 
         return self.async_show_form(
             step_id="reauth_confirm",

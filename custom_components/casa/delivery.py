@@ -7,7 +7,8 @@ import logging
 import math
 import time
 from collections import OrderedDict, defaultdict
-from collections.abc import Mapping
+from collections.abc import AsyncIterator, Mapping
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from typing import Any
 
@@ -43,6 +44,12 @@ class _Delivery:
     phase: str = "ready"
 
 
+@dataclass
+class _PlaybackSlot:
+    lock: asyncio.Lock
+    users: int = 0
+
+
 class SatelliteResolutionError(Exception):
     """Base class for fail-closed satellite resolution errors."""
 
@@ -65,6 +72,7 @@ class SatelliteDirectory:
         self._entity_states: dict[str, str] = {}
         self._entity_idle_since: dict[str, float] = {}
         self._device_events: dict[str, asyncio.Event] = {}
+        self._playback_slots: dict[str, _PlaybackSlot] = {}
 
     def _event(self, device_id: str) -> asyncio.Event:
         event = self._device_events.get(device_id)
@@ -77,15 +85,23 @@ class SatelliteDirectory:
         """Return the process-local event pulsed by mapping or state changes."""
         return self._event(device_id)
 
+    def discard_change_event(
+        self,
+        device_id: str,
+        event: asyncio.Event,
+    ) -> None:
+        """Discard one exact unused signal without removing a newer generation."""
+        if self._device_events.get(device_id) is event:
+            self._device_events.pop(device_id, None)
+
     def _notify(self, device_id: str | None, *, retire: bool = False) -> None:
         if device_id is None:
             return
-        if retire:
-            event = self._device_events.pop(device_id, None)
-            if event is not None:
-                event.set()
-            return
-        self._event(device_id).set()
+        event = self._device_events.pop(device_id, None)
+        if not retire:
+            self._device_events[device_id] = asyncio.Event()
+        if event is not None:
+            event.set()
 
     def add(self, device_id: str, entity_id: str) -> None:
         """Add or rebind one current Assist satellite registry entity."""
@@ -163,6 +179,30 @@ class SatelliteDirectory:
         """Return when the resolved satellite most recently entered idle."""
         return self._entity_idle_since.get(self.resolve(device_id))
 
+    @asynccontextmanager
+    async def playback_slot(self, device_id: str) -> AsyncIterator[None]:
+        """Serialize one device's playback across every agent manager."""
+        slot = self._playback_slots.get(device_id)
+        if slot is None:
+            slot = _PlaybackSlot(lock=asyncio.Lock())
+            self._playback_slots[device_id] = slot
+        slot.users += 1
+        try:
+            async with slot.lock:
+                yield
+        finally:
+            slot.users -= 1
+            if (
+                slot.users == 0
+                and self._playback_slots.get(device_id) is slot
+            ):
+                self._playback_slots.pop(device_id, None)
+
+    @property
+    def playback_slot_count_for_test(self) -> int:
+        """Expose retained shared playback slots for lifecycle assertions."""
+        return len(self._playback_slots)
+
 
 class BackgroundDeliveryManager:
     """Reconstructible HA-side workers for Casa's durable delivery offers."""
@@ -187,7 +227,6 @@ class BackgroundDeliveryManager:
         self._clock = clock or _SystemClock()
         self._queues: dict[str, asyncio.Queue[_Delivery]] = {}
         self._workers: dict[str, asyncio.Task] = {}
-        self._mutexes: dict[str, asyncio.Lock] = {}
         self._attempts: dict[tuple[str, str], _Delivery] = {}
         self._authorization: dict[tuple[str, str], asyncio.Future[bool]] = {}
         self._delivered: OrderedDict[str, None] = OrderedDict()
@@ -323,7 +362,6 @@ class BackgroundDeliveryManager:
                 ):
                     self._queues.pop(device_id, None)
                     self._workers.pop(device_id, None)
-                    self._mutexes.pop(device_id, None)
                     return
 
     async def _deliver(self, delivery: _Delivery) -> None:
@@ -339,58 +377,61 @@ class BackgroundDeliveryManager:
         await self._send(self._frame(delivery, "job_claimed"))
         renewer = asyncio.create_task(self._renew_claim(delivery))
         try:
-            if not await self._wait_for_stable_idle(delivery):
-                await self._abort_idle_wait(delivery)
-                return
-            lock = self._mutexes.setdefault(delivery.device_id, asyncio.Lock())
-            async with lock:
-                if not self._ready_for_playback(delivery):
-                    await self._abort_preplay(delivery)
-                    return
-                key = (delivery.job_id, delivery.attempt_id)
-                authorization = asyncio.get_running_loop().create_future()
-                self._authorization[key] = authorization
-                delivery.phase = "authorizing"
-                try:
-                    await self._send(self._frame(delivery, "job_delivery_start"))
-                    authorized = await self._wait_authorization(delivery, authorization)
-                finally:
-                    self._authorization.pop(key, None)
-                if not authorized:
-                    if delivery.lease_lost.is_set():
-                        return
-                    if delivery.revoked.is_set():
-                        await self._ack_revoked(delivery)
-                    else:
-                        await self._nack(delivery, "authorization_timeout")
-                    return
-                delivery.phase = "authorized"
-                if not self._ready_for_playback(delivery):
-                    await self._abort_preplay(delivery)
-                    return
-                delivery.phase = "playing"
-                await self._send(self._frame(delivery, "job_playback_started"))
-                if not self._ready_for_playback(delivery):
-                    return
-                announce_started = self._clock.now
-                await self.hass.services.async_call(
-                    "assist_satellite",
-                    "announce",
-                    {
-                        "entity_id": delivery.entity_id,
-                        "message": delivery.spoken_text,
-                    },
-                    blocking=True,
-                )
-                _LOGGER.debug(
-                    "Casa background announce announce_ms=%d state=complete",
-                    max(0, int((self._clock.now - announce_started) * 1000)),
-                )
-                self._remember_delivered(delivery.job_id)
-                await self._send(self._frame(delivery, "job_delivered"))
+            async with self.directory.playback_slot(delivery.device_id):
+                await self._deliver_in_playback_slot(delivery)
         finally:
             renewer.cancel()
             await asyncio.gather(renewer, return_exceptions=True)
+
+    async def _deliver_in_playback_slot(self, delivery: _Delivery) -> None:
+        """Wait, authorize, and announce while holding the shared device slot."""
+        if not await self._wait_for_stable_idle(delivery):
+            await self._abort_idle_wait(delivery)
+            return
+        if not self._ready_for_playback(delivery):
+            await self._abort_preplay(delivery)
+            return
+        key = (delivery.job_id, delivery.attempt_id)
+        authorization = asyncio.get_running_loop().create_future()
+        self._authorization[key] = authorization
+        delivery.phase = "authorizing"
+        try:
+            await self._send(self._frame(delivery, "job_delivery_start"))
+            authorized = await self._wait_authorization(delivery, authorization)
+        finally:
+            self._authorization.pop(key, None)
+        if not authorized:
+            if delivery.lease_lost.is_set():
+                return
+            if delivery.revoked.is_set():
+                await self._ack_revoked(delivery)
+            else:
+                await self._nack(delivery, "authorization_timeout")
+            return
+        delivery.phase = "authorized"
+        if not self._ready_for_playback(delivery):
+            await self._abort_preplay(delivery)
+            return
+        delivery.phase = "playing"
+        await self._send(self._frame(delivery, "job_playback_started"))
+        if not self._ready_for_playback(delivery):
+            return
+        announce_started = self._clock.now
+        await self.hass.services.async_call(
+            "assist_satellite",
+            "announce",
+            {
+                "entity_id": delivery.entity_id,
+                "message": delivery.spoken_text,
+            },
+            blocking=True,
+        )
+        _LOGGER.debug(
+            "Casa background announce announce_ms=%d state=complete",
+            max(0, int((self._clock.now - announce_started) * 1000)),
+        )
+        self._remember_delivered(delivery.job_id)
+        await self._send(self._frame(delivery, "job_delivered"))
 
     async def _renew_claim(self, delivery: _Delivery) -> None:
         renew_count = 0
@@ -415,14 +456,16 @@ class BackgroundDeliveryManager:
             and not delivery.lease_lost.is_set()
         ):
             event = self.directory.change_event(delivery.device_id)
-            event.clear()
             try:
                 if self.directory.resolve(delivery.device_id) != delivery.entity_id:
                     return False
                 state = self.directory.state(delivery.device_id)
                 idle_since = self.directory.idle_since(delivery.device_id)
             except SatelliteResolutionError:
+                self.directory.discard_change_event(delivery.device_id, event)
                 return False
+            if event.is_set():
+                continue
             if state == "idle" and idle_since is not None:
                 remaining = self._idle_stability_s - (self._clock.now - idle_since)
                 if remaining <= 0:
@@ -615,8 +658,8 @@ class BackgroundDeliveryManager:
 
     @property
     def mutex_count_for_test(self) -> int:
-        """Expose manager-owned device mutex count for lifecycle assertions."""
-        return len(self._mutexes)
+        """Expose directory-owned device playback slots for compatibility tests."""
+        return self.directory.playback_slot_count_for_test
 
     @property
     def attempt_count_for_test(self) -> int:
@@ -652,7 +695,6 @@ class BackgroundDeliveryManager:
         self._attempts.clear()
         self._queues.clear()
         self._workers.clear()
-        self._mutexes.clear()
         self._delivered.clear()
         self._owned_tasks.clear()
 

@@ -60,6 +60,10 @@ class AuthenticationError(Exception):
     """Raised when Casa returns 401."""
 
 
+class CasaClientClosedError(ConnectionError):
+    """Raised when an operation races or follows client shutdown."""
+
+
 class ConnectionState(StrEnum):
     """Availability state of this client's WebSocket connection."""
 
@@ -272,7 +276,7 @@ class CasaApiClient:
     async def _ensure_ws(self) -> aiohttp.ClientWebSocketResponse:
         async with self._ws_lock:
             if self._closed:
-                raise RuntimeError("Casa API client is closed")
+                raise CasaClientClosedError("Casa API client is closed")
             if self._connection_state is ConnectionState.AUTH_FAILED:
                 raise AuthenticationError("Invalid webhook secret")
             if self._ws is not None and not self._ws.closed:
@@ -289,12 +293,12 @@ class CasaApiClient:
                 raise
             if self._closed:
                 await ws.close()
-                raise RuntimeError("Casa API client is closed")
+                raise CasaClientClosedError("Casa API client is closed")
 
             async with self._ws_write_lock:
                 if self._closed:
                     await ws.close()
-                    raise RuntimeError("Casa API client is closed")
+                    raise CasaClientClosedError("Casa API client is closed")
                 self._ws = ws
                 self._ws_generation += 1
                 generation = self._ws_generation
@@ -586,7 +590,7 @@ class CasaApiClient:
     ) -> None:
         """Eagerly connect and supervise a negotiated background voice route."""
         if self._closed:
-            raise RuntimeError("Casa API client is closed")
+            raise CasaClientClosedError("Casa API client is closed")
         self._route_id = route_id
         self._route_agent_role = agent_role
         self._job_handler = job_handler
@@ -606,7 +610,7 @@ class CasaApiClient:
             if ws is not None and generation is not None:
                 await self._retire_ws_generation(ws, generation)
         if self._closed:
-            raise RuntimeError("Casa API client is closed")
+            raise CasaClientClosedError("Casa API client is closed")
         if self._ws_supervisor is None or self._ws_supervisor.done():
             self._ws_supervisor = asyncio.create_task(self._supervise_ws())
 
@@ -629,8 +633,10 @@ class CasaApiClient:
         if transport != "ws":
             _LOGGER.debug("Session registration requested on SSE transport — no-op")
             return
-        ws = await self._ensure_ws()
+        ws = self._ws
         generation = self._ws_generation
+        if not self.connected or ws is None or ws.closed:
+            return
         await self._send_json({
             "type": "stt_start",
             "session_key": f"voice:{scope_id}",

@@ -158,7 +158,7 @@ class CasaConversationEntity(conversation.ConversationEntity):
             except AuthenticationError:
                 self.entry.async_start_reauth(self.hass)
                 error_frame = ErrorFrame(kind_="auth", spoken="")
-            except (aiohttp.ClientError, aiohttp.ServerDisconnectedError):
+            except (aiohttp.ClientError, OSError):
                 error_frame = ErrorFrame(kind_="connection", spoken="")
 
         async for _ in chat_log.async_add_delta_content_stream(

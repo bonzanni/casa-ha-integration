@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import asyncio
 from types import MappingProxyType
 from unittest.mock import AsyncMock, MagicMock
 
+import aiohttp
 import pytest
 
 from homeassistant.components import conversation as ha_conversation
@@ -453,6 +455,51 @@ class TestHandleMessageErrors:
             _ChatLogCapture(),
         )
         entity.entry.async_start_reauth.assert_called_once_with(entity.hass)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "failure",
+        [
+            aiohttp.ClientError("offline"),
+            ConnectionError("socket closed"),
+            OSError("network unavailable"),
+        ],
+    )
+    async def test_connection_failures_use_spoken_fallback(self, failure):
+        entity = _entity()
+
+        async def raising(**_kwargs):
+            raise failure
+            yield
+
+        entity._client.stream_utterance = MagicMock(side_effect=raising)
+
+        result = await entity._async_handle_message(
+            _input(device_id="d-1"),
+            _ChatLogCapture(),
+        )
+
+        assert result.response._speech["speech"] == FALLBACK
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "failure",
+        [RuntimeError("programming defect"), asyncio.CancelledError()],
+    )
+    async def test_non_connection_failures_propagate(self, failure):
+        entity = _entity()
+
+        async def raising(**_kwargs):
+            raise failure
+            yield
+
+        entity._client.stream_utterance = MagicMock(side_effect=raising)
+
+        with pytest.raises(type(failure)):
+            await entity._async_handle_message(
+                _input(device_id="d-1"),
+                _ChatLogCapture(),
+            )
 
     @pytest.mark.asyncio
     async def test_zero_content_done_triggers_silent_fallback(self):

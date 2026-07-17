@@ -766,6 +766,50 @@ class TestParentSetup:
         entry.async_start_reauth.assert_not_called()
 
     @pytest.mark.asyncio
+    async def test_preactivation_auth_callback_starts_reauth_after_setup(self):
+        child = _subentry("butler", "Tina", subentry_id="child-butler")
+        entry = _entry(child)
+        hass = _hass()
+        forward_started = asyncio.Event()
+        release_forward = asyncio.Event()
+
+        async def block_forward(*_args):
+            forward_started.set()
+            await release_forward.wait()
+
+        hass.config_entries.async_forward_entry_setups.side_effect = block_forward
+
+        async def report_auth_without_raising(**_kwargs):
+            clients.children[0].state_callback(ConnectionState.AUTH_FAILED)
+
+        clients = _ClientHarness(
+            _catalog("butler", "Tina"),
+            start_effects=(report_auth_without_raising,),
+        )
+        managers = _ManagerHarness()
+
+        try:
+            with patch("custom_components.casa.CasaApiClient", side_effect=clients), \
+                 patch(
+                     "custom_components.casa.BackgroundDeliveryManager",
+                     side_effect=managers,
+                 ), \
+                 patch("custom_components.casa.SessionRegistrationListener"):
+                setup = asyncio.create_task(async_setup_entry(hass, entry))
+                await asyncio.wait_for(forward_started.wait(), timeout=1)
+                entry.async_start_reauth.assert_not_called()
+                release_forward.set()
+                assert await asyncio.wait_for(setup, timeout=1) is True
+        finally:
+            release_forward.set()
+
+        assert (
+            entry.runtime_data.agents["child-butler"].connection_state
+            is ConnectionState.AUTH_FAILED
+        )
+        entry.async_start_reauth.assert_called_once_with(hass)
+
+    @pytest.mark.asyncio
     @pytest.mark.parametrize(
         "failure_seam",
         [

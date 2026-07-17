@@ -60,9 +60,9 @@ class SessionRegistrationListener:
 
     @callback
     def handle(self, event: Any) -> None:
+        old_state = event.data.get("old_state")
         new_state = event.data.get("new_state")
         if new_state is None:
-            old_state = event.data.get("old_state")
             entity_id = getattr(old_state, "entity_id", None)
             if isinstance(entity_id, str) and entity_id.startswith("assist_satellite."):
                 self._directory.remove(entity_id)
@@ -72,6 +72,8 @@ class SessionRegistrationListener:
             return
         device_id = self._update_directory(new_state)
         if device_id is None or new_state.state != "listening":
+            return
+        if old_state is not None and getattr(old_state, "state", None) == "listening":
             return
         self._on_listening(device_id)
 

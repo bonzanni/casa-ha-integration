@@ -353,16 +353,18 @@ class TestReauth:
         assert result["type"] == "form"
 
     @pytest.mark.asyncio
-    async def test_replaces_secret_after_catalog_fetch_and_retains_children(self):
+    async def test_loaded_entry_replaces_secret_and_uses_listener_reload(self):
         child = _agent_subentry()
         children = {child.subentry_id: child}
         entry = SimpleNamespace(
+            entry_id="entry-1",
             data={
                 CONF_HOST: "casa.local",
                 CONF_PORT: 18065,
                 CONF_WEBHOOK_SECRET: "old-secret",
             },
             subentries=children,
+            update_listeners=(MagicMock(),),
         )
         flow = CasaConfigFlow()
         flow.hass = MagicMock()
@@ -383,6 +385,89 @@ class TestReauth:
             CONF_PORT: 18065,
             CONF_WEBHOOK_SECRET: "new-secret",
         })
+        assert entry.data[CONF_WEBHOOK_SECRET] == "new-secret"
+        assert entry.subentries is children
+        assert entry.subentries[child.subentry_id] is child
+        flow.hass.config_entries.async_schedule_reload.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_loaded_entry_same_secret_schedules_one_explicit_reload(self):
+        child = _agent_subentry()
+        children = {child.subentry_id: child}
+        entry = SimpleNamespace(
+            entry_id="entry-1",
+            data={
+                CONF_HOST: "casa.local",
+                CONF_PORT: 18065,
+                CONF_WEBHOOK_SECRET: "restored-secret",
+            },
+            subentries=children,
+            update_listeners=(MagicMock(),),
+        )
+        flow = CasaConfigFlow()
+        flow.hass = MagicMock()
+        flow._get_reauth_entry = MagicMock(return_value=entry)
+        update_and_abort = flow.async_update_and_abort
+        flow.async_update_and_abort = MagicMock(wraps=update_and_abort)
+        flow.async_update_reload_and_abort = MagicMock(
+            side_effect=AssertionError("loaded entry already has a listener"),
+        )
+
+        with patch(
+            "custom_components.casa.config_flow._fetch_catalog",
+            AsyncMock(return_value=CATALOG),
+        ):
+            result = await flow.async_step_reauth_confirm({
+                CONF_WEBHOOK_SECRET: "restored-secret",
+            })
+
+        assert result == {"type": "abort", "reason": "reauth_successful"}
+        flow.async_update_and_abort.assert_called_once_with(
+            entry,
+            data_updates={CONF_WEBHOOK_SECRET: "restored-secret"},
+        )
+        flow.hass.config_entries.async_schedule_reload.assert_called_once_with(
+            "entry-1",
+        )
+        assert entry.subentries is children
+        assert entry.subentries[child.subentry_id] is child
+
+    @pytest.mark.asyncio
+    async def test_setup_failed_entry_replaces_secret_and_schedules_reload(self):
+        child = _agent_subentry()
+        children = {child.subentry_id: child}
+        entry = SimpleNamespace(
+            entry_id="entry-1",
+            data={
+                CONF_HOST: "casa.local",
+                CONF_PORT: 18065,
+                CONF_WEBHOOK_SECRET: "old-secret",
+            },
+            subentries=children,
+            update_listeners=(),
+        )
+        flow = CasaConfigFlow()
+        flow.hass = MagicMock()
+        flow._get_reauth_entry = MagicMock(return_value=entry)
+        flow.async_update_and_abort = MagicMock(
+            side_effect=AssertionError("no listener can reload this entry"),
+        )
+        reload_and_abort = flow.async_update_reload_and_abort
+        flow.async_update_reload_and_abort = MagicMock(wraps=reload_and_abort)
+
+        with patch(
+            "custom_components.casa.config_flow._fetch_catalog",
+            AsyncMock(return_value=CATALOG),
+        ):
+            result = await flow.async_step_reauth_confirm({
+                CONF_WEBHOOK_SECRET: "new-secret",
+            })
+
+        assert result == {"type": "abort", "reason": "reauth_successful"}
+        flow.async_update_reload_and_abort.assert_called_once_with(
+            entry,
+            data_updates={CONF_WEBHOOK_SECRET: "new-secret"},
+        )
         assert entry.data[CONF_WEBHOOK_SECRET] == "new-secret"
         assert entry.subentries is children
         assert entry.subentries[child.subentry_id] is child

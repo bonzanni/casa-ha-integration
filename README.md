@@ -1,12 +1,40 @@
 # Casa HA Integration
 
-Companion custom integration that routes Home Assistant's Assist pipeline through the [Casa add-on](https://github.com/bonzanni/casa-ha-app) — a multi-agent AI assistant built around Claude. It ships streaming TTS deltas, voice session registration via `assist_satellite` state listening, a "never silent" error path, and acknowledgement-gated delivery of completed background specialist jobs.
+Companion custom integration that connects Home Assistant to the
+[Casa add-on](https://github.com/bonzanni/casa-ha-app). Integration v0.4.0
+creates one Casa parent from the server's authenticated voice-agent catalog,
+then exposes separate conversation entities for Tina, Gary, and future
+catalog-discovered agents. Each entity has its own routing, connection,
+availability, session settings, and background-delivery lifecycle.
+
+The integration streams TTS deltas, registers voice sessions from
+`assist_satellite` state changes, provides a never-silent error path, and
+supports acknowledgement-gated delivery of completed background specialist
+jobs.
 
 ## Requirements
 
 - Home Assistant Core 2026.4 or newer.
-- Casa add-on running and reachable on the local network.
-- HACS (Home Assistant Community Store) installed.
+- The Casa server release that provides the authenticated
+  `GET /api/voice/agents` schema-1 catalog, running and reachable on the local
+  network.
+- HACS (Home Assistant Community Store).
+
+## Compatibility and v0.4.0 upgrade
+
+Upgrade the Casa server before installing integration v0.4.0. Older Casa
+servers do not expose `GET /api/voice/agents` and cannot create a new v0.4.0
+entry or reconcile its catalog. An existing v0.4.0 entry with retained children
+may load in degraded mode without catalog reconciliation while the endpoint is
+unavailable, but it cannot discover new, renamed, or restored agents. This
+recovery behavior does not replace the supported server-first upgrade order:
+the server endpoint release must land before the integration release.
+
+v0.4.0 is a clean break from v0.3.0; there is no automatic entry migration.
+Before upgrading, note which pipelines use Casa. Then delete the existing Casa
+integration entry, install v0.4.0, add Casa again, and recreate affected Assist
+pipelines with the matching discovered agent. This avoids retaining the old
+single-entity configuration or an obsolete pipeline entity reference.
 
 Casa checks an HMAC of the empty HTTP upgrade body to authenticate the
 integration client when the WebSocket is established. That handshake does not
@@ -14,43 +42,79 @@ authenticate individual frames, and plain `ws://` provides no encryption or
 cryptographic server authentication. Keep the Casa-to-Home Assistant
 connection on a trusted LAN, private network, or encrypted tunnel.
 
-## Install
+## Install and configure
 
-1. In HACS, open **Integrations** → **⋮** → **Custom repositories**.
-2. Add `https://github.com/bonzanni/casa-ha-integration` with category **Integration**.
-3. Install **Casa** from the list, then restart Home Assistant.
-4. Go to **Settings → Devices & services → Add integration → Casa**.
-5. Enter host (e.g. `casa-addon`), port (default `18065`), and the webhook secret configured on your Casa add-on.
-6. Assign **Casa Butler** as the conversation agent of any Assist pipeline you want Casa to handle.
+1. Upgrade Casa to the server release that includes the authenticated agent
+   catalog endpoint.
+2. In HACS, open **Integrations** → **⋮** → **Custom repositories**.
+3. Add `https://github.com/bonzanni/casa-ha-integration` with category
+   **Integration**.
+4. Install **Casa**, then restart Home Assistant.
+5. Go to **Settings → Devices & services → Add integration → Casa**.
+6. Enter the exact host, port (default `18065`), and Casa webhook secret. Setup
+   authenticates and validates the complete catalog before creating one parent
+   plus its voice-agent children.
+7. In each Assist pipeline, select the matching discovered agent: Tina for
+   direct butler turns, Gary for concierge/specialist work, or the relevant
+   future catalog agent.
 
-## Options
+There is no agent role field. Roles and display names come from Casa and remain
+fixed for each discovered child, so a pipeline cannot silently reroute to a
+different agent.
 
-Open the integration **Configure** panel to change:
+Manual setup rejects another entry with the exact host and port. The Casa
+Supervisor UUID remains authoritative when Supervisor discovery is available;
+manual setup cannot prove that different aliases for the same host identify the
+same installation, so alias-based duplicates remain possible.
 
-- **Agent role** — which Casa agent handles turns. Default: `butler`.
-- **Assist idle stability** — how long an Assist satellite must remain idle
-  before queued background audio starts (0–5000 ms; default: 750 ms). A
-  satellite that was already stably idle is not delayed.
-- **Satellite entity overrides** — optional JSON device-to-entity bindings for
-  devices that expose more than one `assist_satellite` entity.
-- **Session mode** — how memory scope is derived: `device` (default), `user`, `conversation`.
-- **Transport** — `ws` (default, enables barge-in, registration, and negotiated
+## Options and agent settings
+
+### Parent configuration
+
+The parent **Configure** action contains only **Satellite entity overrides**.
+This optional JSON object maps a Home Assistant device ID to one exact
+`assist_satellite` entity when that device exposes multiple candidates. Leave
+it as `{}` unless Casa reports an ambiguous satellite; invalid or cross-device
+bindings are rejected.
+
+### Per-agent reconfiguration
+
+Use the **Reconfigure** action for the matching voice-agent child. Each child
+owns these mutable fields:
+
+- **Session mode** — memory scope derived per `device`, `user`, or
+  `conversation`. Tina defaults to device scope, Gary defaults to conversation
+  scope, and future roles default to device scope.
+- **Transport** — `ws` (default, with session registration and negotiated
   background delivery) or `sse` (stateless synchronous fallback).
+- **Assist idle stability** — how long the satellite must remain idle before a
+  queued result plays, from 0–5000 ms (default 750 ms).
 
-## Background specialist delivery
+Role and catalog name are not editable. Home Assistant cannot make a config
+subentry non-removable: if a user deletes a still-advertised voice-agent child,
+it is recreated on the next reload with the same parent-plus-role entity and
+route identity. If Casa stops advertising a role, its retained entity remains
+unavailable and never falls back to another child's client.
 
-With WebSocket transport, the integration eagerly registers a protocol-1 route
-and advertises `background_jobs` plus `satellite_announce`. Background delivery
-is enabled only after Casa acknowledges both capabilities on that exact socket
-generation. Old Casa releases do not acknowledge the registration, so the
-integration remains `background_capable=false` while ordinary synchronous Tina
-and Gary turns continue unchanged.
+## Runtime and background delivery
+
+Every present agent owns a separate API client, WebSocket supervisor, route,
+delivery manager, availability state, and cleanup boundary. Only the satellite
+directory and state listener are shared. A disconnected, missing, or failing
+child does not change another child's availability or routing.
+
+With WebSocket transport, each agent registers a protocol-1 route and
+advertises `background_jobs` plus `satellite_announce`. Background delivery is
+enabled only after Casa acknowledges both capabilities on that exact socket
+generation. A role using SSE remains available for synchronous turns without a
+persistent socket.
 
 Completed work is queued per satellite. If the satellite is already idle it is
 announced immediately; otherwise the integration waits for the current voice
 interaction to finish and for the configured stable-idle interval. Queues are
-FIFO per device, while different devices can progress independently. A user may
-cancel before playback starts; playback already underway is not interrupted.
+FIFO per device, while different devices and different agent routes remain
+isolated. A user may cancel before playback starts; playback already underway
+is not interrupted.
 
 Casa is the sole durable job owner. The integration records completed job IDs
 in a bounded, process-local delivered cache before it sends the acknowledgement.
@@ -61,36 +125,81 @@ acknowledgement is lost, the concise summary may repeat after a manager or
 integration process restart, or after delivered-cache eviction, rather than
 being silently lost.
 
-## E2E checklist
+## Release acceptance
 
-Run end-to-end against a real HA + Casa add-on before tagging a release. The
-legacy synchronous matrix was last verified 2026-07-11 against HA Core 2026.6.4,
-HACS 2.0.5, and Casa add-on 0.65.2. The 0.3.0 background path remains dark until
-its separate live Voice PE acceptance matrix is completed.
+Release acceptance has two layers: reproducible real-system exercises and
+automated fault-injection gates. Both must pass before publishing v0.4.0.
 
-1. HACS install completes. Config flow accepts valid secret; rejects invalid secret with the `Invalid webhook secret` error.
-2. Assign Casa Butler as pipeline conversation agent. Voice turn from a satellite flows STT → Casa → TTS with audible butler reply.
-3. Trigger a satellite wake with debug logging enabled for `custom_components.casa`. HA logs `Registering voice session scope=<device_id>` before the utterance arrives. (Casa 0.4x+ registers the scope for idle-sweep/dedup only; it no longer prewarms memory on `stt_start`.)
-4. Barge in mid-TTS. Casa receives a `cancel` frame for the in-flight utterance; HA recovers; next turn succeeds.
-5. Disconnect Casa mid-conversation. Satellite speaks the fallback line, HA does not go silent, reconnect recovers without integration reload.
-6. Switch **Transport** to `sse` via Options. Integration reloads. One full turn works (no session registration, expected).
-7. Change the webhook secret on Casa without updating HA. Next turn triggers reauth; entering the new secret restores normal operation.
-8. Against a protocol-1 Casa route, complete one background job while the
-   satellite is busy and verify it is announced only after stable idle. Drop
-   the WebSocket before the delivered acknowledgement and verify an ordinary
-   reconnect claims and acknowledges the reoffer without replay. Repeat with
-   an integration restart before the reoffer and verify the summary may replay
-   once but is never silently lost.
+### Real-system E2E
 
-## Architecture
+Run these checks against a real Home Assistant instance and the released Casa
+catalog endpoint, with the Casa server upgraded first:
 
-See [phase 2.4 design spec](https://github.com/bonzanni/casa-ha-app/blob/master/docs/superpowers/specs/2026-04-17-ha-integration-2.4.md) for full design rationale. The [voice-pipeline 2.3 spec](https://github.com/bonzanni/casa-ha-app/blob/master/docs/superpowers/specs/2026-04-17-voice-pipeline-design.md) is the wire-contract source of truth.
+1. Confirm the authenticated catalog accepts the configured webhook secret and
+   rejects a bad secret.
+2. Add one Casa parent and verify it creates two conversation entities, Tina
+   and Gary, with separate stable entity IDs. Confirm no role selector appears
+   on the parent or agent forms.
+3. Select Tina in a pipeline. After one warm-up turn, measure at least 20 direct
+   turns with monotonic timestamps and require server
+   utterance-to-first-text-block p95 below 1.5 seconds and Home Assistant
+   end-of-speech-to-first-audible-output p95 below 3.0 seconds. Confirm every
+   request carries `butler` and the configured Tina session scope.
+4. Select Gary in another pipeline. Complete a Gary background result while
+   the satellite is busy; verify it is announced only after stable idle and
+   uses Gary's route, not Tina's.
+5. Barge in during Tina TTS. Verify Casa receives a `cancel` frame for that
+   utterance, Home Assistant recovers, and the next turn succeeds.
+6. Replace the Casa webhook secret. Confirm terminal authentication starts one
+   parent reauthentication flow, and entering the new secret restores every
+   child without duplicate reauth prompts.
 
-## Limitations (2.4)
+### Controlled fault-injection acceptance
 
-- Voice-ID speaker promotion lands when HA exposes stable `user_input.context.user_id` — no integration change needed.
-- SSML output blocked by HA's Assist pipeline; plain tag dialects only.
-- No pytest-HA harness tests — manual E2E above is the gating bar. Queued for 2.4.1.
+These are automated end-to-end gates, not ad hoc live checks. Run them with a
+controllable Casa catalog fixture, a WebSocket protocol proxy, and Home
+Assistant task and socket introspection so the injected boundary and every
+required observable are deterministic:
+
+1. Make the catalog fixture return malformed schema and malformed agent data;
+   verify validation is atomic and the existing children do not partially
+   change.
+2. Stop advertising one role, reload, and verify the missing role remains
+   unavailable while the other entity continues to connect and answer. Restore
+   the role and confirm the same stable identity returns.
+3. Move a satellite from a non-listening state into `LISTENING` and verify each
+   connected WebSocket child registers the device once for that wake edge. An
+   attribute-only repeated `LISTENING` state update must not send another
+   registration. Switch one child to SSE and confirm it remains synchronously
+   usable without session registration or a background socket.
+4. Disconnect one Casa route mid-conversation through the protocol proxy. That
+   entity must speak the fallback line and reconnect without an integration
+   reload; the sibling remains usable and receives no availability transition.
+5. Exercise isolated cleanup: unload or reload with both agents active and use
+   task and socket introspection to verify every child socket, delivery worker,
+   registration task, and the one shared listener close without leaking or
+   rerouting work between children.
+6. Have the protocol proxy drop Gary's WebSocket after playback but before the
+   delivered acknowledgement. An ordinary reconnect must claim and acknowledge
+   the reoffer without replay; after an integration restart the summary may
+   replay once but must never be silently lost.
+
+## Architecture and limitations
+
+The parent owns host, port, webhook secret, catalog health, satellite override,
+and the shared satellite directory/listener. Catalog-owned child entries own a
+fixed role/name plus mutable session, transport, and idle settings. Reload
+reconciliation adds and renames children through public Home Assistant APIs but
+does not delete a role merely because it is temporarily absent.
+
+- Manual duplicate prevention compares the exact host/port pair; aliases for
+  the same server remain the documented limitation described above.
+- Voice-ID speaker promotion depends on Home Assistant exposing a stable
+  `user_input.context.user_id`.
+- Home Assistant Assist output does not support SSML; Casa sends plain text.
+- Unit tests use lightweight Home Assistant stubs rather than the full
+  pytest-Home-Assistant harness, so both release-acceptance layers remain gates
+  alongside tests, hassfest, and HACS validation.
 
 ## License
 

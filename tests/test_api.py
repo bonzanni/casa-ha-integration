@@ -14,6 +14,7 @@ from custom_components.casa.api import (
     AuthenticationError,
     BlockFrame,
     CasaApiClient,
+    CasaClientClosedError,
     ConnectionState,
     DoneFrame,
     ErrorFrame,
@@ -22,6 +23,9 @@ from custom_components.casa.catalog import CatalogValidationError
 
 
 class TestCasaFrames:
+    def test_client_closed_error_is_a_connection_error(self):
+        assert issubclass(CasaClientClosedError, ConnectionError)
+
     def test_block_frame_fields(self):
         f = BlockFrame(text="hello", final=False)
         assert f.text == "hello"
@@ -544,17 +548,43 @@ class TestSessionRegistration:
     async def test_ws_registration_sends_stt_start(self):
         import custom_components.casa.api as api_mod
         session = MagicMock()
-        ws = _FakeWS(outgoing=[])
+        ws = _FakeWS(stay_open=True)
         session.ws_connect = AsyncMock(return_value=ws)
         client = api_mod.CasaApiClient(session=session, host="h", port=1, webhook_secret="sec")
-        await client.register_session(
-            scope_id="dev-1", transport="ws", agent_role="concierge",
+        try:
+            await client._ensure_ws()
+            await client.register_session(
+                scope_id="dev-1", transport="ws", agent_role="concierge",
+            )
+            sent = [s for s in ws.sent if s.get("type") == "stt_start"]
+            assert sent
+            assert sent[0]["scope_id"] == "dev-1"
+            assert sent[0]["session_key"] == "voice:dev-1"
+            assert sent[0]["agent_role"] == "concierge"
+            assert session.ws_connect.await_count == 1
+        finally:
+            await client.close()
+
+    @pytest.mark.asyncio
+    async def test_disconnected_ws_registration_never_connects(self):
+        session = MagicMock()
+        session.ws_connect = AsyncMock(
+            side_effect=AssertionError("registration must not connect"),
         )
-        sent = [s for s in ws.sent if s.get("type") == "stt_start"]
-        assert sent
-        assert sent[0]["scope_id"] == "dev-1"
-        assert sent[0]["session_key"] == "voice:dev-1"
-        assert sent[0]["agent_role"] == "concierge"
+        client = CasaApiClient(
+            session=session,
+            host="h",
+            port=1,
+            webhook_secret="sec",
+        )
+
+        await client.register_session(
+            scope_id="dev-1",
+            transport="ws",
+            agent_role="concierge",
+        )
+
+        session.ws_connect.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_sse_registration_noops(self, api_client: CasaApiClient, mock_session: MagicMock):
@@ -1129,7 +1159,7 @@ class TestConnectionState:
         await client.close()
         release_connect.set()
 
-        with pytest.raises(RuntimeError, match="closed"):
+        with pytest.raises(CasaClientClosedError, match="closed"):
             await startup
         assert states == []
         assert client._ws_supervisor is None
@@ -1165,7 +1195,7 @@ class TestConnectionState:
         await client.close()
         release_connect.set()
 
-        with pytest.raises(RuntimeError, match="closed"):
+        with pytest.raises(CasaClientClosedError, match="closed"):
             await startup
         assert states == []
         assert client._ws_supervisor is None

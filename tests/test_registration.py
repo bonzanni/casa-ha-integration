@@ -32,7 +32,7 @@ def _state_change_event(
     new_state_state: str | None,
     domain: str = "assist_satellite",
     *,
-    old_state_state: str = "idle",
+    old_state_state: str | None = "idle",
     changed_at: float = 100.0,
 ):
     ev = MagicMock()
@@ -41,7 +41,11 @@ def _state_change_event(
         if new_state_state is not None
         else None
     )
-    old = _state(entity_id, old_state_state, domain=domain, changed_at=changed_at - 1)
+    old = (
+        _state(entity_id, old_state_state, domain=domain, changed_at=changed_at - 1)
+        if old_state_state is not None
+        else None
+    )
     ev.data = {"new_state": new, "old_state": old}
     return ev
 
@@ -148,6 +152,52 @@ class TestSessionRegistrationListener:
         assert not hasattr(listener, "_client")
         assert not hasattr(listener, "_transport")
         assert not hasattr(listener, "_agent_role")
+
+    def test_repeated_listening_state_event_does_not_register_twice(self):
+        hass = MagicMock()
+        on_listening = MagicMock()
+
+        from homeassistant.helpers import entity_registry as er
+        entity_entry = MagicMock(device_id="dev-kitchen")
+        registry = MagicMock()
+        registry.async_get = MagicMock(return_value=entity_entry)
+        er.async_get = MagicMock(return_value=registry)
+
+        directory = SatelliteDirectory()
+        listener = _listener(hass, on_listening, directory=directory)
+        listener.handle(_state_change_event(
+            "assist_satellite.kitchen",
+            "listening",
+            old_state_state="idle",
+            changed_at=100.0,
+        ))
+        listener.handle(_state_change_event(
+            "assist_satellite.kitchen",
+            "listening",
+            old_state_state="listening",
+            changed_at=101.0,
+        ))
+
+        on_listening.assert_called_once_with("dev-kitchen")
+        assert directory.state("dev-kitchen") == "listening"
+        assert registry.async_get.call_count == 2
+
+    def test_initial_listening_state_without_old_state_registers(self):
+        hass = MagicMock()
+        on_listening = MagicMock()
+
+        from homeassistant.helpers import entity_registry as er
+        entity_entry = MagicMock(device_id="dev-kitchen")
+        er.async_get = MagicMock(return_value=MagicMock(async_get=lambda _id: entity_entry))
+
+        listener = _listener(hass, on_listening)
+        listener.handle(_state_change_event(
+            "assist_satellite.kitchen",
+            "listening",
+            old_state_state=None,
+        ))
+
+        on_listening.assert_called_once_with("dev-kitchen")
 
     def test_tracks_non_listening_states_without_callback(self):
         hass = MagicMock()

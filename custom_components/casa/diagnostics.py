@@ -13,7 +13,9 @@ async def async_get_config_entry_diagnostics(
     entry: ConfigEntry,
 ) -> dict[str, Any]:
     """Return only non-sensitive parent and child health state."""
-    runtime = entry.runtime_data
+    runtime = getattr(entry, "runtime_data", None)
+    if runtime is None:
+        return {"catalog_healthy": False, "agents": []}
     return {
         "catalog_healthy": runtime.catalog_healthy,
         "agents": [

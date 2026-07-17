@@ -294,21 +294,24 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     runtime_active = False
     reauth_started = False
 
-    def connection_state_changed(
-        runtime: CasaAgentRuntime,
-        state: ConnectionState,
-    ) -> None:
+    def maybe_start_reauth() -> None:
         nonlocal reauth_started
-        runtime.set_connection_state(state)
         if (
-            state is ConnectionState.AUTH_FAILED
-            and runtime_active
+            runtime_active
             and parent_runtime is not None
             and entry.runtime_data is parent_runtime
             and not reauth_started
         ):
             reauth_started = True
             entry.async_start_reauth(hass)
+
+    def connection_state_changed(
+        runtime: CasaAgentRuntime,
+        state: ConnectionState,
+    ) -> None:
+        runtime.set_connection_state(state)
+        if state is ConnectionState.AUTH_FAILED:
+            maybe_start_reauth()
 
     try:
         for subentry in _persisted_agent_subentries(entry):
@@ -406,6 +409,11 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 pass
             raise
         runtime_active = True
+        if any(
+            runtime.connection_state is ConnectionState.AUTH_FAILED
+            for runtime in agents.values()
+        ):
+            maybe_start_reauth()
     except BaseException:
         entry.runtime_data = None
         try:
