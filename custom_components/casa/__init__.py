@@ -131,7 +131,11 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     if not ok:
         return False
     if entry.runtime_data is not None:
-        entry.runtime_data.listener.detach()
-        await entry.runtime_data.manager.close()
-        await entry.runtime_data.client.close()
+        try:
+            entry.runtime_data.listener.detach()
+        finally:
+            try:
+                await entry.runtime_data.manager.close()
+            finally:
+                await entry.runtime_data.client.close()
     return True

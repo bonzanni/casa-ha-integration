@@ -77,18 +77,25 @@ class SatelliteDirectory:
         """Return the process-local event pulsed by mapping or state changes."""
         return self._event(device_id)
 
-    def _notify(self, device_id: str | None) -> None:
-        if device_id is not None:
-            self._event(device_id).set()
+    def _notify(self, device_id: str | None, *, retire: bool = False) -> None:
+        if device_id is None:
+            return
+        if retire:
+            event = self._device_events.pop(device_id, None)
+            if event is not None:
+                event.set()
+            return
+        self._event(device_id).set()
 
     def add(self, device_id: str, entity_id: str) -> None:
         """Add or rebind one current Assist satellite registry entity."""
         previous_device = self._entity_devices.get(entity_id)
         if previous_device is not None and previous_device != device_id:
             self._device_entities[previous_device].discard(entity_id)
-            if not self._device_entities[previous_device]:
+            previous_device_retired = not self._device_entities[previous_device]
+            if previous_device_retired:
                 self._device_entities.pop(previous_device, None)
-            self._notify(previous_device)
+            self._notify(previous_device, retire=previous_device_retired)
         self._entity_devices[entity_id] = device_id
         self._device_entities[device_id].add(entity_id)
         self._notify(device_id)
@@ -96,13 +103,15 @@ class SatelliteDirectory:
     def remove(self, entity_id: str) -> None:
         """Remove an entity and every state datum associated with it."""
         device_id = self._entity_devices.pop(entity_id, None)
+        device_retired = False
         if device_id is not None:
             self._device_entities[device_id].discard(entity_id)
             if not self._device_entities[device_id]:
                 self._device_entities.pop(device_id, None)
+                device_retired = True
         self._entity_states.pop(entity_id, None)
         self._entity_idle_since.pop(entity_id, None)
-        self._notify(device_id)
+        self._notify(device_id, retire=device_retired)
 
     def resolve(self, device_id: str) -> str:
         """Resolve exactly one currently valid entity, applying overrides safely."""
@@ -397,7 +406,6 @@ class BackgroundDeliveryManager:
             _LOGGER.debug("Casa background lease renew_count=%d", renew_count)
 
     async def _wait_for_stable_idle(self, delivery: _Delivery) -> bool:
-        event = self.directory.change_event(delivery.device_id)
         reset_count = 0
         started = self._clock.now
         while (
@@ -405,6 +413,7 @@ class BackgroundDeliveryManager:
             and not delivery.revoked.is_set()
             and not delivery.lease_lost.is_set()
         ):
+            event = self.directory.change_event(delivery.device_id)
             event.clear()
             try:
                 if self.directory.resolve(delivery.device_id) != delivery.entity_id:

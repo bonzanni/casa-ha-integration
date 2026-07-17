@@ -221,6 +221,44 @@ class TestSetup:
             client.close.assert_not_awaited()
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("failure_stage", ["listener", "manager", "client"])
+    async def test_unload_cleanup_runs_later_stages_and_preserves_exception(
+        self, failure_stage,
+    ):
+        hass = MagicMock()
+        hass.config_entries.async_unload_platforms = AsyncMock(return_value=True)
+        entry = _entry()
+        order: list[str] = []
+        expected_error = RuntimeError(f"{failure_stage} cleanup failed")
+
+        def detach_listener():
+            order.append("listener")
+            if failure_stage == "listener":
+                raise expected_error
+
+        async def close_manager():
+            order.append("manager")
+            if failure_stage == "manager":
+                raise expected_error
+
+        async def close_client():
+            order.append("client")
+            if failure_stage == "client":
+                raise expected_error
+
+        runtime = MagicMock()
+        runtime.listener.detach.side_effect = detach_listener
+        runtime.manager.close = AsyncMock(side_effect=close_manager)
+        runtime.client.close = AsyncMock(side_effect=close_client)
+        entry.runtime_data = runtime
+
+        with pytest.raises(RuntimeError) as raised:
+            await async_unload_entry(hass, entry)
+
+        assert raised.value is expected_error
+        assert order == ["listener", "manager", "client"]
+
+    @pytest.mark.asyncio
     async def test_unload_order_is_listener_then_manager_then_client(self):
         hass = MagicMock()
         hass.config_entries.async_forward_entry_setups = AsyncMock()

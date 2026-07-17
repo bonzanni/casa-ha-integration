@@ -178,6 +178,17 @@ class TestSatelliteDirectory:
         with pytest.raises(SatelliteNotFound):
             directory.resolve("dev-new")
 
+    def test_departed_devices_do_not_accumulate_change_events(self):
+        directory = SatelliteDirectory()
+
+        for index in range(300):
+            entity_id = f"assist_satellite.transient_{index}"
+            directory.add(f"dev-{index}", entity_id)
+            directory.add("dev-current", entity_id)
+            directory.remove(entity_id)
+
+        assert directory._device_events == {}
+
     def test_ambiguous_device_retains_exact_entity_states_for_valid_override(self):
         directory = SatelliteDirectory(overrides={
             "dev-k": "assist_satellite.kitchen_2",
@@ -274,6 +285,33 @@ class TestStableIdleDelivery:
 
         await clock.advance(0.001)
         await manager.drain_for_test()
+        manager.hass.services.async_call.assert_awaited_once()
+
+    async def test_recreated_device_event_does_not_disconnect_idle_waiter(
+        self, delivery_manager,
+    ):
+        manager, clock = delivery_manager
+        entity_id = "assist_satellite.kitchen"
+        manager.directory.set_state("dev-k", "processing", changed_at=clock.now)
+        await manager.handle_frame(job_ready("job-1"))
+        await clock.settle()
+        old_event = manager.directory.change_event("dev-k")
+
+        manager.directory.remove(entity_id)
+        manager.directory.add("dev-k", entity_id)
+        manager.directory.set_entity_state(
+            "dev-k", entity_id, "processing", changed_at=clock.now,
+        )
+
+        assert manager.directory.change_event("dev-k") is not old_event
+        await clock.settle()
+        manager.directory.set_entity_state(
+            "dev-k", entity_id, "idle", changed_at=clock.now,
+        )
+        await clock.settle()
+        await clock.advance(0.75)
+        await asyncio.wait_for(manager.drain_for_test(), timeout=1)
+
         manager.hass.services.async_call.assert_awaited_once()
 
 
