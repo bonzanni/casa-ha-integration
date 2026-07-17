@@ -50,7 +50,7 @@ def test_ack_loss_replay_boundary_is_explicit(filename):
     assert "can never replay after a manager or integration process restart" not in text
 
 
-def test_release_metadata_is_v050_with_existing_ha_minimum():
+def test_release_metadata_is_v051_with_existing_ha_minimum():
     manifest = json.loads(
         (_ROOT / "custom_components/casa/manifest.json").read_text(
             encoding="utf-8",
@@ -58,7 +58,7 @@ def test_release_metadata_is_v050_with_existing_ha_minimum():
     )
     hacs = json.loads((_ROOT / "hacs.json").read_text(encoding="utf-8"))
 
-    assert manifest["version"] == "0.5.0"
+    assert manifest["version"] == "0.5.1"
     assert hacs["homeassistant"] == "2026.4.0"
 
 

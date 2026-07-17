@@ -1,7 +1,7 @@
 # Casa
 
 Casa is the Home Assistant companion integration for the Casa add-on. Version
-0.5.0 connects one **Casa** parent to the server's authenticated voice-agent
+0.5.1 connects one **Casa** parent to the server's authenticated voice-agent
 catalog and creates separate role-stable conversation entities for Butler,
 Concierge, and future agents.
 Each child keeps a fixed catalog role and its own client, connection,
