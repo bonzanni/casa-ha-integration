@@ -189,6 +189,30 @@ class TestSatelliteDirectory:
 
         assert directory._device_events == {}
 
+    @pytest.mark.asyncio
+    async def test_one_shot_change_generation_wakes_two_waiters(self):
+        directory = SatelliteDirectory()
+        directory.add("dev-k", "assist_satellite.kitchen")
+        first_signal = directory.change_event("dev-k")
+        second_signal = directory.change_event("dev-k")
+        assert second_signal is first_signal
+        first_waiter = asyncio.create_task(first_signal.wait())
+        second_waiter = asyncio.create_task(second_signal.wait())
+        await asyncio.sleep(0)
+
+        directory.set_state("dev-k", "idle", changed_at=10.0)
+
+        await asyncio.wait_for(
+            asyncio.gather(first_waiter, second_waiter),
+            timeout=1,
+        )
+        replacement = directory.change_event("dev-k")
+        assert replacement is not first_signal
+        assert replacement.is_set() is False
+        assert first_signal.is_set() is True
+        directory.discard_change_event("dev-k", first_signal)
+        assert directory.change_event("dev-k") is replacement
+
     def test_ambiguous_device_retains_exact_entity_states_for_valid_override(self):
         directory = SatelliteDirectory(overrides={
             "dev-k": "assist_satellite.kitchen_2",
@@ -203,6 +227,218 @@ class TestSatelliteDirectory:
         assert directory.resolve("dev-k") == "assist_satellite.kitchen_2"
         assert directory.state("dev-k") == "idle"
         assert directory.idle_since("dev-k") == 11.0
+
+
+class TestManagerIsolation:
+    @pytest.mark.asyncio
+    async def test_same_device_and_job_ids_do_not_cross_agent_managers(self):
+        clock = FakeClock()
+        directory = SatelliteDirectory()
+        directory.add("dev-k", "assist_satellite.kitchen")
+        directory.set_state("dev-k", "idle", changed_at=clock.now - 10)
+        hass = MagicMock()
+        hass.services.async_call = AsyncMock()
+        butler_client = FakeClient()
+        concierge_client = FakeClient()
+        butler = BackgroundDeliveryManager(
+            hass,
+            butler_client,
+            route_id="entry-1:butler",
+            directory=directory,
+            clock=clock,
+        )
+        concierge = BackgroundDeliveryManager(
+            hass,
+            concierge_client,
+            route_id="entry-1:concierge",
+            directory=directory,
+            clock=clock,
+        )
+        butler_client.manager = butler
+        concierge_client.manager = concierge
+        butler_offer = job_ready(
+            "shared-job",
+            attempt_id="shared-attempt",
+            route_id="entry-1:butler",
+        )
+        concierge_offer = job_ready(
+            "shared-job",
+            attempt_id="shared-attempt",
+            route_id="entry-1:concierge",
+        )
+
+        try:
+            await concierge.handle_frame(butler_offer)
+            assert concierge_client.sent == []
+
+            await butler.handle_frame(butler_offer)
+            await concierge.handle_frame(concierge_offer)
+            await asyncio.gather(
+                butler.drain_for_test(),
+                concierge.drain_for_test(),
+            )
+
+            assert sent_types(butler_client) == [
+                "job_claimed",
+                "job_delivery_start",
+                "job_playback_started",
+                "job_delivered",
+            ]
+            assert sent_types(concierge_client) == [
+                "job_claimed",
+                "job_delivery_start",
+                "job_playback_started",
+                "job_delivered",
+            ]
+            assert butler.delivered_ids_for_test == frozenset({"shared-job"})
+            assert concierge.delivered_ids_for_test == frozenset({"shared-job"})
+            assert hass.services.async_call.await_count == 2
+        finally:
+            await butler.close()
+            await concierge.close()
+
+    @pytest.mark.asyncio
+    async def test_same_device_playback_is_serialized_across_agent_managers(self):
+        clock = FakeClock()
+        directory = SatelliteDirectory()
+        directory.add("dev-k", "assist_satellite.kitchen")
+        directory.set_state("dev-k", "idle", changed_at=clock.now - 10)
+        hass = MagicMock()
+        first_started = asyncio.Event()
+        release_playback = asyncio.Event()
+        active = 0
+        max_active = 0
+
+        async def announce(*_args, **_kwargs):
+            nonlocal active, max_active
+            active += 1
+            max_active = max(max_active, active)
+            first_started.set()
+            try:
+                await release_playback.wait()
+            finally:
+                active -= 1
+
+        hass.services.async_call = AsyncMock(side_effect=announce)
+        butler_client = FakeClient()
+        concierge_client = FakeClient()
+        butler = BackgroundDeliveryManager(
+            hass,
+            butler_client,
+            route_id="entry-1:butler",
+            directory=directory,
+            clock=clock,
+        )
+        concierge = BackgroundDeliveryManager(
+            hass,
+            concierge_client,
+            route_id="entry-1:concierge",
+            directory=directory,
+            clock=clock,
+        )
+        butler_client.manager = butler
+        concierge_client.manager = concierge
+
+        try:
+            await butler.handle_frame(job_ready(
+                "butler-job",
+                route_id="entry-1:butler",
+                spoken_text="butler result",
+            ))
+            await concierge.handle_frame(job_ready(
+                "concierge-job",
+                route_id="entry-1:concierge",
+                spoken_text="concierge result",
+            ))
+            await asyncio.wait_for(first_started.wait(), timeout=1)
+            await clock.settle()
+
+            assert hass.services.async_call.await_count == 1
+            assert max_active == 1
+
+            release_playback.set()
+            await asyncio.gather(
+                butler.drain_for_test(),
+                concierge.drain_for_test(),
+            )
+
+            assert hass.services.async_call.await_count == 2
+            assert max_active == 1
+            assert directory.playback_slot_count_for_test == 0
+        finally:
+            release_playback.set()
+            await butler.close()
+            await concierge.close()
+
+    @pytest.mark.asyncio
+    async def test_different_devices_play_concurrently_across_agent_managers(self):
+        clock = FakeClock()
+        directory = SatelliteDirectory()
+        directory.add("dev-k", "assist_satellite.kitchen")
+        directory.add("dev-o", "assist_satellite.office")
+        directory.set_state("dev-k", "idle", changed_at=clock.now - 10)
+        directory.set_state("dev-o", "idle", changed_at=clock.now - 10)
+        hass = MagicMock()
+        kitchen_started = asyncio.Event()
+        office_started = asyncio.Event()
+        release_playback = asyncio.Event()
+
+        async def announce(_domain, _service, data, *, blocking):
+            assert blocking is True
+            if data["entity_id"] == "assist_satellite.kitchen":
+                kitchen_started.set()
+            else:
+                office_started.set()
+            await release_playback.wait()
+
+        hass.services.async_call = AsyncMock(side_effect=announce)
+        butler_client = FakeClient()
+        concierge_client = FakeClient()
+        butler = BackgroundDeliveryManager(
+            hass,
+            butler_client,
+            route_id="entry-1:butler",
+            directory=directory,
+            clock=clock,
+        )
+        concierge = BackgroundDeliveryManager(
+            hass,
+            concierge_client,
+            route_id="entry-1:concierge",
+            directory=directory,
+            clock=clock,
+        )
+        butler_client.manager = butler
+        concierge_client.manager = concierge
+
+        try:
+            await butler.handle_frame(job_ready(
+                "kitchen-job",
+                device="dev-k",
+                route_id="entry-1:butler",
+            ))
+            await concierge.handle_frame(job_ready(
+                "office-job",
+                device="dev-o",
+                route_id="entry-1:concierge",
+            ))
+            await asyncio.wait_for(
+                asyncio.gather(kitchen_started.wait(), office_started.wait()),
+                timeout=1,
+            )
+
+            assert hass.services.async_call.await_count == 2
+
+            release_playback.set()
+            await asyncio.gather(
+                butler.drain_for_test(),
+                concierge.drain_for_test(),
+            )
+            assert directory.playback_slot_count_for_test == 0
+        finally:
+            release_playback.set()
+            await butler.close()
+            await concierge.close()
 
 
 class TestStableIdleDelivery:
@@ -587,6 +823,8 @@ class TestFinalRechecksAndRevocation:
         assert manager.client.sent[-1]["type"] == "job_nack"
         assert manager.client.sent[-1]["reason"] == reason
         assert "job_revoked" not in sent_types(manager.client)
+        if change == "remove":
+            assert "dev-k" not in manager.directory._device_events
 
 
 class TestPerDeviceWorkers:

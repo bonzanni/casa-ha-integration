@@ -1,314 +1,963 @@
-"""Tests for Casa __init__ setup wiring."""
+"""Tests for Casa parent and per-agent runtime wiring."""
 
 from __future__ import annotations
 
 import asyncio
-from unittest.mock import AsyncMock, MagicMock, patch
+import logging
+from types import MappingProxyType
+from unittest.mock import ANY, AsyncMock, MagicMock, patch
 
 import aiohttp
 import pytest
 
-from custom_components.casa import async_setup_entry, async_unload_entry
+from homeassistant.config_entries import ConfigSubentry
+from homeassistant.exceptions import ConfigEntryAuthFailed, ConfigEntryNotReady
+
+from custom_components.casa import (
+    CasaAgentRuntime,
+    async_setup_entry,
+    async_unload_entry,
+)
+from custom_components.casa.api import AuthenticationError, ConnectionState
+from custom_components.casa.catalog import (
+    CatalogValidationError,
+    VoiceAgent,
+    VoiceAgentCatalog,
+)
 from custom_components.casa.const import (
-    CONF_AGENT_ROLE, CONF_HOST, CONF_IDLE_STABILITY_MS, CONF_PORT,
-    CONF_SATELLITE_ENTITY_OVERRIDES, CONF_WEBHOOK_SECRET,
-    CONF_TRANSPORT, DEFAULT_TRANSPORT,
+    CONF_AGENT_NAME,
+    CONF_HOST,
+    CONF_IDLE_STABILITY_MS,
+    CONF_PORT,
+    CONF_ROLE,
+    CONF_SATELLITE_ENTITY_OVERRIDES,
+    CONF_SESSION_MODE,
+    CONF_TRANSPORT,
+    CONF_WEBHOOK_SECRET,
+    SUBENTRY_TYPE_AGENT,
+    TRANSPORT_SSE,
+    TRANSPORT_WS,
 )
 
 
-def _entry():
+def _catalog(*role_names: str) -> VoiceAgentCatalog:
+    return VoiceAgentCatalog(
+        schema_version=1,
+        agents=tuple(
+            VoiceAgent(role=role_names[index], name=role_names[index + 1])
+            for index in range(0, len(role_names), 2)
+        ),
+    )
+
+
+def _subentry(
+    role: str,
+    name: str,
+    *,
+    subentry_id: str | None = None,
+    transport: str = TRANSPORT_WS,
+    session_mode: str = "device",
+    idle_stability_ms: int = 750,
+) -> ConfigSubentry:
+    kwargs = {}
+    if subentry_id is not None:
+        kwargs["subentry_id"] = subentry_id
+    return ConfigSubentry(
+        data=MappingProxyType({
+            CONF_ROLE: role,
+            CONF_AGENT_NAME: name,
+            CONF_SESSION_MODE: session_mode,
+            CONF_TRANSPORT: transport,
+            CONF_IDLE_STABILITY_MS: idle_stability_ms,
+        }),
+        subentry_type=SUBENTRY_TYPE_AGENT,
+        title=name,
+        unique_id=role,
+        **kwargs,
+    )
+
+
+def _entry(*children: ConfigSubentry):
     entry = MagicMock()
     entry.entry_id = "entry-1"
-    entry.data = {CONF_HOST: "127.0.0.1", CONF_PORT: 18065, CONF_WEBHOOK_SECRET: "s"}
+    entry.data = {
+        CONF_HOST: "127.0.0.1",
+        CONF_PORT: 18065,
+        CONF_WEBHOOK_SECRET: "PRIVATE_PARENT_SECRET",
+    }
     entry.options = {
-        CONF_AGENT_ROLE: "concierge",
-        CONF_IDLE_STABILITY_MS: 1250,
         CONF_SATELLITE_ENTITY_OVERRIDES: (
             '{"dev-k":"assist_satellite.kitchen"}'
         ),
-        CONF_TRANSPORT: DEFAULT_TRANSPORT,
     }
+    entry.subentries = {child.subentry_id: child for child in children}
     entry.runtime_data = None
     entry.async_on_unload = MagicMock()
+    entry.async_start_reauth = MagicMock()
     entry.add_update_listener = MagicMock(return_value=lambda: None)
     return entry
 
 
-class _SupervisedClient:
-    """Small lifecycle-real client whose supervisor leaks unless close is awaited."""
+def _hass(order: list[str] | None = None):
+    hass = MagicMock()
+    order = order if order is not None else []
 
+    def add_subentry(entry, subentry):
+        order.append("reconcile_add")
+        entry.subentries = {**entry.subentries, subentry.subentry_id: subentry}
+
+    def update_subentry(entry, subentry, **changes):
+        order.append("reconcile_update")
+        for key, value in changes.items():
+            object.__setattr__(subentry, key, value)
+
+    async def forward(*_args):
+        order.append("forward")
+
+    hass.config_entries.async_add_subentry = MagicMock(side_effect=add_subentry)
+    hass.config_entries.async_update_subentry = MagicMock(
+        side_effect=update_subentry,
+    )
+    hass.config_entries.async_forward_entry_setups = AsyncMock(
+        side_effect=forward,
+    )
+    hass.config_entries.async_unload_platforms = AsyncMock(return_value=True)
+    return hass
+
+
+class _ClientHarness:
+    def __init__(
+        self,
+        catalog: VoiceAgentCatalog | None = None,
+        *,
+        fetch_error: BaseException | None = None,
+        start_effects: tuple[BaseException | None, ...] = (),
+    ) -> None:
+        self.temp = MagicMock()
+        self.temp.fetch_voice_agents = AsyncMock(
+            return_value=catalog,
+            side_effect=fetch_error,
+        )
+        self.temp.close = AsyncMock()
+        self.children: list[MagicMock] = []
+        self.start_effects = start_effects
+
+    def __call__(self, **kwargs):
+        if "state_callback" not in kwargs:
+            return self.temp
+        index = len(self.children)
+        client = MagicMock()
+        client.state_callback = kwargs["state_callback"]
+        effect = self.start_effects[index] if index < len(self.start_effects) else None
+        client.start_background = AsyncMock(side_effect=effect)
+        client.register_session = AsyncMock()
+        client.close = AsyncMock()
+        self.children.append(client)
+        return client
+
+
+class _ManagerHarness:
     def __init__(self) -> None:
-        self.reconnect_attempts_for_test = 0
-        self._closed = False
-        self._pulse = asyncio.Event()
-        self._supervisor: asyncio.Task | None = None
+        self.items: list[MagicMock] = []
+        self.calls: list[dict] = []
 
-    async def health_check(self) -> bool:
-        return True
+    def __call__(
+        self,
+        hass,
+        client,
+        *,
+        route_id,
+        directory,
+        idle_stability_ms,
+    ):
+        manager = MagicMock()
+        manager.handle_frame = AsyncMock()
+        manager.close = AsyncMock()
+        self.items.append(manager)
+        self.calls.append({
+            "hass": hass,
+            "client": client,
+            "route_id": route_id,
+            "directory": directory,
+            "idle_stability_ms": idle_stability_ms,
+        })
+        return manager
 
-    async def start_background(self, **_kwargs) -> None:
-        self._supervisor = asyncio.create_task(self._run_supervisor())
 
-    async def _run_supervisor(self) -> None:
-        while True:
-            await self._pulse.wait()
-            self._pulse.clear()
-            if self._closed:
-                return
-            self.reconnect_attempts_for_test += 1
+def _agent_runtime(
+    *,
+    transport: str = TRANSPORT_WS,
+    catalog_present: bool = True,
+    client=None,
+    manager=None,
+) -> CasaAgentRuntime:
+    if client is None and catalog_present:
+        client = MagicMock()
+        client.register_session = AsyncMock()
+        client.close = AsyncMock()
+    if manager is None and catalog_present:
+        manager = MagicMock()
+        manager.close = AsyncMock()
+    return CasaAgentRuntime(
+        parent_entry_id="entry-1",
+        subentry_id="child-butler",
+        role="butler",
+        name="Tina",
+        session_mode="device",
+        transport=transport,
+        idle_stability_ms=750,
+        catalog_present=catalog_present,
+        client=client,
+        manager=manager,
+    )
 
-    async def pulse_reconnect(self) -> None:
-        self._pulse.set()
-        for _ in range(4):
+
+class TestAgentRuntime:
+    def test_stable_ids_and_exact_availability_notifications(self):
+        runtime = _agent_runtime()
+        changed = MagicMock()
+        unsubscribe = runtime.async_add_availability_listener(changed)
+
+        assert runtime.route_id == "entry-1:butler"
+        assert runtime.entity_unique_id == "entry-1:butler"
+        assert runtime.available is False
+
+        runtime.set_connection_state(ConnectionState.CONNECTED)
+        assert runtime.available is True
+        changed.assert_called_once_with()
+
+        runtime.set_connection_state(ConnectionState.CONNECTED)
+        changed.assert_called_once_with()
+
+        runtime.set_connection_state(ConnectionState.DISCONNECTED)
+        assert runtime.available is False
+        assert changed.call_count == 2
+
+        unsubscribe()
+        runtime.set_connection_state(ConnectionState.CONNECTED)
+        assert changed.call_count == 2
+
+        assert _agent_runtime(transport=TRANSPORT_SSE).available is True
+        assert _agent_runtime(
+            transport=TRANSPORT_SSE,
+            catalog_present=False,
+            client=None,
+            manager=None,
+        ).available is False
+
+    @pytest.mark.asyncio
+    async def test_register_session_tracks_only_present_ws_client_task(self):
+        runtime = _agent_runtime()
+
+        task = runtime.register_session("dev-kitchen")
+        assert task is not None
+        assert runtime.registration_task_count_for_test == 1
+        await task
+        await asyncio.sleep(0)
+
+        runtime.client.register_session.assert_awaited_once_with(
+            scope_id="dev-kitchen",
+            transport="ws",
+            agent_role="butler",
+        )
+        assert runtime.registration_task_count_for_test == 0
+
+        sse = _agent_runtime(transport=TRANSPORT_SSE)
+        missing = _agent_runtime(
+            catalog_present=False,
+            client=None,
+            manager=None,
+        )
+        assert sse.register_session("dev-kitchen") is None
+        assert missing.register_session("dev-kitchen") is None
+        sse.client.register_session.assert_not_awaited()
+
+        await runtime.async_close()
+        await sse.async_close()
+        await missing.async_close()
+
+    @pytest.mark.asyncio
+    async def test_registration_failure_log_is_role_only_and_generic(self, caplog):
+        exception_canary = "PRIVATE_REGISTRATION_EXCEPTION"
+        device_canary = "PRIVATE_DEVICE_ID"
+        client = MagicMock()
+        client.register_session = AsyncMock(
+            side_effect=RuntimeError(exception_canary),
+        )
+        client.close = AsyncMock()
+        runtime = _agent_runtime(client=client)
+
+        with caplog.at_level(logging.WARNING, logger="custom_components.casa"):
+            task = runtime.register_session(device_canary)
+            assert task is not None
+            await asyncio.gather(task, return_exceptions=True)
             await asyncio.sleep(0)
 
-    async def close(self) -> None:
-        self._closed = True
-        task = self._supervisor
-        if task is not None:
-            task.cancel()
-            await asyncio.gather(task, return_exceptions=True)
-            self._supervisor = None
-
-
-class TestSetup:
-    @pytest.mark.asyncio
-    async def test_setup_happy(self):
-        hass = MagicMock()
-        hass.config_entries.async_forward_entry_setups = AsyncMock()
-        entry = _entry()
-        with patch("custom_components.casa.CasaApiClient") as mock_cls, \
-             patch("custom_components.casa.SessionRegistrationListener") as mock_listener, \
-             patch("custom_components.casa.SatelliteDirectory") as mock_directory, \
-             patch("custom_components.casa.BackgroundDeliveryManager") as mock_manager:
-            client_inst = MagicMock()
-            client_inst.health_check = AsyncMock(return_value=True)
-            client_inst.start_background = AsyncMock()
-            mock_cls.return_value = client_inst
-            ok = await async_setup_entry(hass, entry)
-            assert ok is True
-            mock_cls.assert_called_once()
-            assert entry.runtime_data.client is client_inst
-            assert entry.runtime_data.directory is mock_directory.return_value
-            assert entry.runtime_data.manager is mock_manager.return_value
-            mock_directory.assert_called_once_with(overrides={
-                "dev-k": "assist_satellite.kitchen",
-            })
-            mock_manager.assert_called_once_with(
-                hass,
-                client_inst,
-                route_id="entry-1",
-                directory=mock_directory.return_value,
-                idle_stability_ms=1250,
-            )
-            mock_listener.assert_called_once_with(
-                hass,
-                client_inst,
-                DEFAULT_TRANSPORT,
-                agent_role="concierge",
-                directory=mock_directory.return_value,
-            )
-            mock_listener.return_value.attach.assert_called_once()
-            client_inst.start_background.assert_awaited_once_with(
-                route_id="entry-1",
-                agent_role="concierge",
-                job_handler=mock_manager.return_value.handle_frame,
-            )
-            hass.config_entries.async_forward_entry_setups.assert_awaited_once()
+        assert "role=butler reason=connection" in caplog.text
+        assert exception_canary not in caplog.text
+        assert device_canary not in caplog.text
+        assert all(record.exc_info is None for record in caplog.records)
+        await runtime.async_close()
 
     @pytest.mark.asyncio
-    async def test_sse_setup_never_starts_websocket_for_background_jobs(self):
-        hass = MagicMock()
-        hass.config_entries.async_forward_entry_setups = AsyncMock()
-        entry = _entry()
-        entry.options[CONF_TRANSPORT] = "sse"
-        with patch("custom_components.casa.CasaApiClient") as mock_cls, \
-             patch("custom_components.casa.SessionRegistrationListener"), \
-             patch("custom_components.casa.SatelliteDirectory"), \
-             patch("custom_components.casa.BackgroundDeliveryManager"):
-            client = MagicMock()
-            client.health_check = AsyncMock(return_value=True)
-            client.start_background = AsyncMock()
-            mock_cls.return_value = client
+    async def test_close_cancels_registration_and_closes_all_owners(self):
+        registration_started = asyncio.Event()
+        registration_cancelled = asyncio.Event()
+        manager_error = RuntimeError("manager close failed")
+        order: list[str] = []
 
+        async def register_session(**_kwargs):
+            registration_started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                registration_cancelled.set()
+                raise
+
+        async def close_manager():
+            order.append("manager")
+            raise manager_error
+
+        async def close_client():
+            order.append("client")
+
+        client = MagicMock()
+        client.register_session = AsyncMock(side_effect=register_session)
+        client.close = AsyncMock(side_effect=close_client)
+        manager = MagicMock()
+        manager.close = AsyncMock(side_effect=close_manager)
+        runtime = _agent_runtime(client=client, manager=manager)
+        runtime.register_session("dev-kitchen")
+        await asyncio.wait_for(registration_started.wait(), timeout=1)
+
+        with pytest.raises(RuntimeError) as raised:
+            await runtime.async_close()
+
+        assert raised.value is manager_error
+        assert registration_cancelled.is_set()
+        assert runtime.registration_task_count_for_test == 0
+        assert order == ["manager", "client"]
+
+
+class TestParentSetup:
+    @pytest.mark.asyncio
+    async def test_two_roles_get_isolated_owners_and_one_shared_listener(self):
+        butler = _subentry("butler", "Tina", subentry_id="child-butler")
+        concierge = _subentry(
+            "concierge",
+            "Gary",
+            subentry_id="child-concierge",
+            idle_stability_ms=1250,
+        )
+        entry = _entry(butler, concierge)
+        hass = _hass()
+        clients = _ClientHarness(_catalog("butler", "Tina", "concierge", "Gary"))
+        managers = _ManagerHarness()
+
+        with patch("custom_components.casa.CasaApiClient", side_effect=clients), \
+             patch(
+                 "custom_components.casa.BackgroundDeliveryManager",
+                 side_effect=managers,
+             ), \
+             patch(
+                 "custom_components.casa.SessionRegistrationListener",
+             ) as listener_cls:
             assert await async_setup_entry(hass, entry) is True
 
-            client.start_background.assert_not_awaited()
+        runtime = entry.runtime_data
+        tina = runtime.agents["child-butler"]
+        gary = runtime.agents["child-concierge"]
+        assert runtime.catalog_healthy is True
+        assert tina.client is not gary.client
+        assert tina.manager is not gary.manager
+        assert tina.manager is managers.items[0]
+        assert gary.manager is managers.items[1]
+        assert {call["route_id"] for call in managers.calls} == {
+            "entry-1:butler",
+            "entry-1:concierge",
+        }
+        assert all(call["directory"] is runtime.directory for call in managers.calls)
+        assert {call["client"] for call in managers.calls} == set(clients.children)
+
+        listener_cls.assert_called_once_with(
+            hass,
+            directory=runtime.directory,
+            on_listening=ANY,
+        )
+        assert runtime.listener is listener_cls.return_value
+        listener_cls.return_value.attach.assert_called_once_with()
+        for child in (tina, gary):
+            child.client.start_background.assert_awaited_once_with(
+                route_id=child.route_id,
+                agent_role=child.role,
+                job_handler=child.manager.handle_frame,
+            )
+        hass.config_entries.async_forward_entry_setups.assert_awaited_once()
+        clients.temp.close.assert_awaited_once_with()
+
+        on_listening = listener_cls.call_args.kwargs["on_listening"]
+        on_listening("dev-kitchen")
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        tina.client.register_session.assert_awaited_once_with(
+            scope_id="dev-kitchen",
+            transport="ws",
+            agent_role="butler",
+        )
+        gary.client.register_session.assert_awaited_once_with(
+            scope_id="dev-kitchen",
+            transport="ws",
+            agent_role="concierge",
+        )
+        assert tina.registration_task_count_for_test == 0
+        assert gary.registration_task_count_for_test == 0
 
     @pytest.mark.asyncio
-    async def test_setup_connection_error_raises_not_ready(self):
-        from homeassistant.exceptions import ConfigEntryNotReady
-        hass = MagicMock()
+    async def test_missing_catalog_role_is_retained_without_transport(self):
+        butler = _subentry("butler", "Tina", subentry_id="child-butler")
+        missing = _subentry("legacy", "Old", subentry_id="child-legacy")
+        entry = _entry(butler, missing)
+        hass = _hass()
+        clients = _ClientHarness(_catalog("butler", "Tina"))
+        managers = _ManagerHarness()
+
+        with patch("custom_components.casa.CasaApiClient", side_effect=clients), \
+             patch(
+                 "custom_components.casa.BackgroundDeliveryManager",
+                 side_effect=managers,
+             ), \
+             patch("custom_components.casa.SessionRegistrationListener"):
+            assert await async_setup_entry(hass, entry) is True
+
+        runtime = entry.runtime_data
+        legacy = runtime.agents["child-legacy"]
+        assert legacy.catalog_present is False
+        assert legacy.client is None
+        assert legacy.manager is None
+        assert legacy.available is False
+        assert len(clients.children) == 1
+        assert len(managers.items) == 1
+
+    @pytest.mark.asyncio
+    async def test_present_sse_child_has_owners_without_background_socket(self):
+        child = _subentry(
+            "concierge",
+            "Gary",
+            subentry_id="child-concierge",
+            transport=TRANSPORT_SSE,
+        )
+        entry = _entry(child)
+        hass = _hass()
+        clients = _ClientHarness(_catalog("concierge", "Gary"))
+        managers = _ManagerHarness()
+
+        with patch("custom_components.casa.CasaApiClient", side_effect=clients), \
+             patch(
+                 "custom_components.casa.BackgroundDeliveryManager",
+                 side_effect=managers,
+             ), \
+             patch("custom_components.casa.SessionRegistrationListener"):
+            assert await async_setup_entry(hass, entry) is True
+
+        runtime = entry.runtime_data.agents["child-concierge"]
+        assert runtime.client is clients.children[0]
+        assert runtime.manager is managers.items[0]
+        assert runtime.available is True
+        runtime.client.start_background.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_valid_catalog_reconciles_add_and_rename_before_forward(self):
+        order: list[str] = []
+        butler = _subentry("butler", "Old Tina", subentry_id="child-butler")
+        entry = _entry(butler)
+        original_add_listener = entry.add_update_listener
+
+        def add_update_listener(callback):
+            order.append("update_listener")
+            return original_add_listener(callback)
+
+        entry.add_update_listener = MagicMock(side_effect=add_update_listener)
+        hass = _hass(order)
+        clients = _ClientHarness(_catalog("butler", "Tina", "concierge", "Gary"))
+        managers = _ManagerHarness()
+
+        with patch("custom_components.casa.CasaApiClient", side_effect=clients), \
+             patch(
+                 "custom_components.casa.BackgroundDeliveryManager",
+                 side_effect=managers,
+             ), \
+             patch(
+                 "custom_components.casa.SessionRegistrationListener",
+             ) as listener_cls:
+            listener_cls.return_value.attach.side_effect = lambda: order.append(
+                "listener_attach",
+            )
+            assert await async_setup_entry(hass, entry) is True
+
+        hass.config_entries.async_update_subentry.assert_called_once()
+        hass.config_entries.async_add_subentry.assert_called_once()
+        assert {child.role for child in entry.runtime_data.agents.values()} == {
+            "butler",
+            "concierge",
+        }
+        assert order.index("reconcile_update") < order.index("forward")
+        assert order.index("reconcile_add") < order.index("forward")
+        assert order.index("listener_attach") < order.index("forward")
+        assert order[-1] == "update_listener"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "fetch_error",
+        [
+            aiohttp.ClientError("offline"),
+            OSError("socket failed"),
+            CatalogValidationError("invalid"),
+        ],
+    )
+    async def test_known_child_catalog_failure_loads_degraded(self, fetch_error):
+        child = _subentry("butler", "Tina", subentry_id="child-butler")
+        entry = _entry(child)
+        hass = _hass()
+        clients = _ClientHarness(fetch_error=fetch_error)
+        managers = _ManagerHarness()
+
+        with patch("custom_components.casa.CasaApiClient", side_effect=clients), \
+             patch(
+                 "custom_components.casa.BackgroundDeliveryManager",
+                 side_effect=managers,
+             ), \
+             patch("custom_components.casa.SessionRegistrationListener"):
+            assert await async_setup_entry(hass, entry) is True
+
+        runtime = entry.runtime_data
+        assert runtime.catalog_healthy is False
+        assert runtime.agents["child-butler"].catalog_present is True
+        assert runtime.agents["child-butler"].client is clients.children[0]
+        hass.config_entries.async_add_subentry.assert_not_called()
+        hass.config_entries.async_update_subentry.assert_not_called()
+        clients.temp.close.assert_awaited_once_with()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "fetch_error",
+        [aiohttp.ClientError("offline"), OSError("socket failed")],
+    )
+    async def test_first_catalog_failure_without_child_raises_not_ready(
+        self,
+        fetch_error,
+    ):
         entry = _entry()
-        with patch("custom_components.casa.CasaApiClient") as mock_cls:
-            client_inst = MagicMock()
-            client_inst.health_check = AsyncMock(side_effect=aiohttp.ClientError("down"))
-            mock_cls.return_value = client_inst
+        hass = _hass()
+        clients = _ClientHarness(fetch_error=fetch_error)
+
+        with patch("custom_components.casa.CasaApiClient", side_effect=clients), \
+             patch("custom_components.casa.BackgroundDeliveryManager") as manager_cls, \
+             patch(
+                 "custom_components.casa.SessionRegistrationListener",
+             ) as listener_cls:
             with pytest.raises(ConfigEntryNotReady):
                 await async_setup_entry(hass, entry)
+
+        clients.temp.close.assert_awaited_once_with()
+        manager_cls.assert_not_called()
+        listener_cls.assert_not_called()
+        hass.config_entries.async_forward_entry_setups.assert_not_awaited()
+        assert entry.runtime_data is None
+
+    @pytest.mark.asyncio
+    async def test_catalog_auth_always_raises_auth_failed(self):
+        child = _subentry("butler", "Tina", subentry_id="child-butler")
+        entry = _entry(child)
+        hass = _hass()
+        clients = _ClientHarness(
+            fetch_error=AuthenticationError("PRIVATE_AUTH_FAILURE"),
+        )
+
+        with patch("custom_components.casa.CasaApiClient", side_effect=clients), \
+             patch("custom_components.casa.BackgroundDeliveryManager") as manager_cls, \
+             patch(
+                 "custom_components.casa.SessionRegistrationListener",
+             ) as listener_cls:
+            with pytest.raises(ConfigEntryAuthFailed):
+                await async_setup_entry(hass, entry)
+
+        clients.temp.close.assert_awaited_once_with()
+        manager_cls.assert_not_called()
+        listener_cls.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_one_child_network_start_failure_does_not_stop_sibling(self):
+        butler = _subentry("butler", "Tina", subentry_id="child-butler")
+        concierge = _subentry("concierge", "Gary", subentry_id="child-concierge")
+        entry = _entry(butler, concierge)
+        hass = _hass()
+        clients = _ClientHarness(
+            _catalog("butler", "Tina", "concierge", "Gary"),
+            start_effects=(ConnectionError("offline"), None),
+        )
+        managers = _ManagerHarness()
+
+        with patch("custom_components.casa.CasaApiClient", side_effect=clients), \
+             patch(
+                 "custom_components.casa.BackgroundDeliveryManager",
+                 side_effect=managers,
+             ), \
+             patch("custom_components.casa.SessionRegistrationListener"):
+            assert await async_setup_entry(hass, entry) is True
+
+        assert len(entry.runtime_data.agents) == 2
+        assert all(client.start_background.await_count == 1 for client in clients.children)
+        hass.config_entries.async_forward_entry_setups.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_child_network_failure_log_contains_no_connection_details(
+        self,
+        caplog,
+    ):
+        exception_canary = "PRIVATE_CHILD_CONNECTION_FAILURE"
+        child = _subentry("butler", "Tina", subentry_id="child-butler")
+        entry = _entry(child)
+        hass = _hass()
+        clients = _ClientHarness(
+            _catalog("butler", "Tina"),
+            start_effects=(ConnectionError(exception_canary),),
+        )
+        managers = _ManagerHarness()
+
+        with caplog.at_level(logging.WARNING, logger="custom_components.casa"), \
+             patch("custom_components.casa.CasaApiClient", side_effect=clients), \
+             patch(
+                 "custom_components.casa.BackgroundDeliveryManager",
+                 side_effect=managers,
+             ), \
+             patch("custom_components.casa.SessionRegistrationListener"):
+            assert await async_setup_entry(hass, entry) is True
+
+        assert "role=butler reason=connection" in caplog.text
+        assert exception_canary not in caplog.text
+        assert entry.data[CONF_WEBHOOK_SECRET] not in caplog.text
+        assert entry.data[CONF_HOST] not in caplog.text
+        assert all(record.exc_info is None for record in caplog.records)
+
+    @pytest.mark.asyncio
+    async def test_connection_state_is_child_local_and_reauth_is_parent_deduped(self):
+        butler = _subentry("butler", "Tina", subentry_id="child-butler")
+        concierge = _subentry("concierge", "Gary", subentry_id="child-concierge")
+        entry = _entry(butler, concierge)
+        hass = _hass()
+        clients = _ClientHarness(_catalog("butler", "Tina", "concierge", "Gary"))
+        managers = _ManagerHarness()
+
+        with patch("custom_components.casa.CasaApiClient", side_effect=clients), \
+             patch(
+                 "custom_components.casa.BackgroundDeliveryManager",
+                 side_effect=managers,
+             ), \
+             patch("custom_components.casa.SessionRegistrationListener"):
+            assert await async_setup_entry(hass, entry) is True
+
+        tina = entry.runtime_data.agents["child-butler"]
+        gary = entry.runtime_data.agents["child-concierge"]
+        tina_changed = MagicMock()
+        gary_changed = MagicMock()
+        tina.async_add_availability_listener(tina_changed)
+        gary.async_add_availability_listener(gary_changed)
+
+        tina.client.state_callback(ConnectionState.CONNECTED)
+        assert tina.available is True
+        assert gary.available is False
+        tina_changed.assert_called_once_with()
+        gary_changed.assert_not_called()
+
+        tina.client.state_callback(ConnectionState.AUTH_FAILED)
+        gary.client.state_callback(ConnectionState.AUTH_FAILED)
+        entry.async_start_reauth.assert_called_once_with(hass)
+        assert tina.connection_state is ConnectionState.AUTH_FAILED
+        assert gary.connection_state is ConnectionState.AUTH_FAILED
+        assert tina_changed.call_count == 2
+        assert gary_changed.call_count == 1
+
+    @pytest.mark.asyncio
+    async def test_auth_callback_during_sibling_cleanup_does_not_start_reauth(self):
+        butler = _subentry("butler", "Tina", subentry_id="child-butler")
+        concierge = _subentry("concierge", "Gary", subentry_id="child-concierge")
+        entry = _entry(butler, concierge)
+        hass = _hass()
+        clients = _ClientHarness(_catalog("butler", "Tina", "concierge", "Gary"))
+        managers = _ManagerHarness()
+        first_close_started = asyncio.Event()
+        release_first_close = asyncio.Event()
+
+        async def block_first_close():
+            first_close_started.set()
+            await release_first_close.wait()
+
+        with patch("custom_components.casa.CasaApiClient", side_effect=clients), \
+             patch(
+                 "custom_components.casa.BackgroundDeliveryManager",
+                 side_effect=managers,
+             ), \
+             patch("custom_components.casa.SessionRegistrationListener"):
+            assert await async_setup_entry(hass, entry) is True
+            managers.items[0].close.side_effect = block_first_close
+
+            unload_task = asyncio.create_task(async_unload_entry(hass, entry))
+            await asyncio.wait_for(first_close_started.wait(), timeout=1)
+            assert entry.runtime_data is None
+
+            clients.children[1].state_callback(ConnectionState.AUTH_FAILED)
+            entry.async_start_reauth.assert_not_called()
+
+            release_first_close.set()
+            assert await asyncio.wait_for(unload_task, timeout=1) is True
+
+    @pytest.mark.asyncio
+    async def test_child_auth_rolls_back_every_sibling_without_masking_auth(self):
+        butler = _subentry("butler", "Tina", subentry_id="child-butler")
+        concierge = _subentry("concierge", "Gary", subentry_id="child-concierge")
+        entry = _entry(butler, concierge)
+        hass = _hass()
+        clients = _ClientHarness(
+            _catalog("butler", "Tina", "concierge", "Gary"),
+            start_effects=(AuthenticationError("PRIVATE_AUTH_FAILURE"), None),
+        )
+        managers = _ManagerHarness()
+
+        with patch("custom_components.casa.CasaApiClient", side_effect=clients), \
+             patch(
+                 "custom_components.casa.BackgroundDeliveryManager",
+                 side_effect=managers,
+             ), \
+             patch("custom_components.casa.SessionRegistrationListener"):
+            with pytest.raises(ConfigEntryAuthFailed):
+                await async_setup_entry(hass, entry)
+
+        assert entry.runtime_data is None
+        assert len(clients.children) == 2
+        assert all(client.close.await_count == 1 for client in clients.children)
+        assert all(manager.close.await_count == 1 for manager in managers.items)
+        hass.config_entries.async_forward_entry_setups.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_setup_auth_callback_relies_on_auth_failed_exception_only(self):
+        child = _subentry("butler", "Tina", subentry_id="child-butler")
+        entry = _entry(child)
+        hass = _hass()
+
+        async def authenticate_then_fail(**_kwargs):
+            clients.children[0].state_callback(ConnectionState.AUTH_FAILED)
+            raise AuthenticationError("PRIVATE_AUTH_FAILURE")
+
+        clients = _ClientHarness(
+            _catalog("butler", "Tina"),
+            start_effects=(authenticate_then_fail,),
+        )
+        managers = _ManagerHarness()
+
+        with patch("custom_components.casa.CasaApiClient", side_effect=clients), \
+             patch(
+                 "custom_components.casa.BackgroundDeliveryManager",
+                 side_effect=managers,
+             ), \
+             patch("custom_components.casa.SessionRegistrationListener"):
+            with pytest.raises(ConfigEntryAuthFailed):
+                await async_setup_entry(hass, entry)
+
+        entry.async_start_reauth.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_preactivation_auth_callback_starts_reauth_after_setup(self):
+        child = _subentry("butler", "Tina", subentry_id="child-butler")
+        entry = _entry(child)
+        hass = _hass()
+        forward_started = asyncio.Event()
+        release_forward = asyncio.Event()
+
+        async def block_forward(*_args):
+            forward_started.set()
+            await release_forward.wait()
+
+        hass.config_entries.async_forward_entry_setups.side_effect = block_forward
+
+        async def report_auth_without_raising(**_kwargs):
+            clients.children[0].state_callback(ConnectionState.AUTH_FAILED)
+
+        clients = _ClientHarness(
+            _catalog("butler", "Tina"),
+            start_effects=(report_auth_without_raising,),
+        )
+        managers = _ManagerHarness()
+
+        try:
+            with patch("custom_components.casa.CasaApiClient", side_effect=clients), \
+                 patch(
+                     "custom_components.casa.BackgroundDeliveryManager",
+                     side_effect=managers,
+                 ), \
+                 patch("custom_components.casa.SessionRegistrationListener"):
+                setup = asyncio.create_task(async_setup_entry(hass, entry))
+                await asyncio.wait_for(forward_started.wait(), timeout=1)
+                entry.async_start_reauth.assert_not_called()
+                release_forward.set()
+                assert await asyncio.wait_for(setup, timeout=1) is True
+        finally:
+            release_forward.set()
+
+        assert (
+            entry.runtime_data.agents["child-butler"].connection_state
+            is ConnectionState.AUTH_FAILED
+        )
+        entry.async_start_reauth.assert_called_once_with(hass)
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
         "failure_seam",
-        ["listener_attach", "start_background", "forward_platforms"],
+        [
+            "listener",
+            "platform",
+            "add_update_listener",
+            "async_on_unload",
+        ],
     )
-    async def test_setup_abort_after_attach_cleans_listener_manager_and_client(
-        self, failure_seam,
+    async def test_setup_rollback_detaches_and_closes_every_child(
+        self,
+        failure_seam,
     ):
-        hass = MagicMock()
-        hass.config_entries.async_forward_entry_setups = AsyncMock()
-        entry = _entry()
-        order: list[str] = []
-        with patch("custom_components.casa.CasaApiClient") as mock_cls, \
-             patch("custom_components.casa.SessionRegistrationListener") as mock_listener, \
-             patch("custom_components.casa.SatelliteDirectory"), \
-             patch("custom_components.casa.BackgroundDeliveryManager") as mock_manager:
-            client = MagicMock()
-            client.health_check = AsyncMock(return_value=True)
-            client.start_background = AsyncMock()
+        butler = _subentry("butler", "Tina", subentry_id="child-butler")
+        concierge = _subentry("concierge", "Gary", subentry_id="child-concierge")
+        entry = _entry(butler, concierge)
+        hass = _hass()
+        clients = _ClientHarness(_catalog("butler", "Tina", "concierge", "Gary"))
+        managers = _ManagerHarness()
+        setup_error = RuntimeError(f"{failure_seam} failed")
+        cleanup_error = RuntimeError("first cleanup failed")
+        update_unsubscribe = MagicMock()
 
-            async def close_client():
-                order.append("client")
+        async def fail_platform(*_args):
+            managers.items[0].close.side_effect = cleanup_error
+            raise setup_error
 
-            async def close_manager():
-                order.append("manager")
-
-            client.close = AsyncMock(side_effect=close_client)
-            mock_listener.return_value.detach.side_effect = lambda: order.append("listener")
-            mock_manager.return_value.close = AsyncMock(side_effect=close_manager)
-            mock_cls.return_value = client
-            if failure_seam == "listener_attach":
-                mock_listener.return_value.attach.side_effect = RuntimeError(
-                    "listener failed",
-                )
-            elif failure_seam == "start_background":
-                client.start_background.side_effect = ConnectionError("offline")
+        with patch("custom_components.casa.CasaApiClient", side_effect=clients), \
+             patch(
+                 "custom_components.casa.BackgroundDeliveryManager",
+                 side_effect=managers,
+             ), \
+             patch(
+                 "custom_components.casa.SessionRegistrationListener",
+             ) as listener_cls:
+            if failure_seam == "listener":
+                listener_cls.return_value.attach.side_effect = setup_error
+            elif failure_seam == "add_update_listener":
+                entry.add_update_listener.side_effect = setup_error
+            elif failure_seam == "async_on_unload":
+                entry.add_update_listener.return_value = update_unsubscribe
+                entry.async_on_unload.side_effect = setup_error
             else:
-                hass.config_entries.async_forward_entry_setups.side_effect = RuntimeError(
-                    "platform failed",
-                )
+                hass.config_entries.async_forward_entry_setups.side_effect = fail_platform
 
-            with pytest.raises((ConnectionError, RuntimeError)):
+            with pytest.raises(RuntimeError) as raised:
                 await async_setup_entry(hass, entry)
 
-            assert order == ["listener", "manager", "client"]
-            assert entry.runtime_data is None
+        assert raised.value is setup_error
+        assert entry.runtime_data is None
+        listener_cls.return_value.detach.assert_called_once_with()
+        assert all(manager.close.await_count == 1 for manager in managers.items)
+        assert all(client.close.await_count == 1 for client in clients.children)
+        if failure_seam == "add_update_listener":
+            entry.add_update_listener.assert_called_once_with(ANY)
+            entry.async_on_unload.assert_not_called()
+        elif failure_seam == "async_on_unload":
+            entry.add_update_listener.assert_called_once_with(ANY)
+            entry.async_on_unload.assert_called_once_with(
+                update_unsubscribe,
+            )
+            update_unsubscribe.assert_called_once_with()
+        else:
+            entry.add_update_listener.assert_not_called()
 
+
+class TestParentUnload:
     @pytest.mark.asyncio
-    async def test_failed_platform_unload_keeps_runtime_resources_active(self):
-        hass = MagicMock()
-        hass.config_entries.async_forward_entry_setups = AsyncMock()
-        hass.config_entries.async_unload_platforms = AsyncMock(return_value=False)
+    async def test_platform_unload_failure_keeps_runtime_active(self):
         entry = _entry()
-        with patch("custom_components.casa.CasaApiClient") as mock_cls, \
-             patch("custom_components.casa.SessionRegistrationListener") as mock_listener, \
-             patch("custom_components.casa.SatelliteDirectory"), \
-             patch("custom_components.casa.BackgroundDeliveryManager") as mock_manager:
-            client = MagicMock()
-            client.health_check = AsyncMock(return_value=True)
-            client.start_background = AsyncMock()
-            client.close = AsyncMock()
-            mock_manager.return_value.close = AsyncMock()
-            mock_cls.return_value = client
-            await async_setup_entry(hass, entry)
-            runtime = entry.runtime_data
-
-            assert await async_unload_entry(hass, entry) is False
-
-            assert entry.runtime_data is runtime
-            mock_listener.return_value.detach.assert_not_called()
-            mock_manager.return_value.close.assert_not_awaited()
-            client.close.assert_not_awaited()
-
-    @pytest.mark.asyncio
-    @pytest.mark.parametrize("failure_stage", ["listener", "manager", "client"])
-    async def test_unload_cleanup_runs_later_stages_and_preserves_exception(
-        self, failure_stage,
-    ):
-        hass = MagicMock()
-        hass.config_entries.async_unload_platforms = AsyncMock(return_value=True)
-        entry = _entry()
-        order: list[str] = []
-        expected_error = RuntimeError(f"{failure_stage} cleanup failed")
-
-        def detach_listener():
-            order.append("listener")
-            if failure_stage == "listener":
-                raise expected_error
-
-        async def close_manager():
-            order.append("manager")
-            if failure_stage == "manager":
-                raise expected_error
-
-        async def close_client():
-            order.append("client")
-            if failure_stage == "client":
-                raise expected_error
-
         runtime = MagicMock()
-        runtime.listener.detach.side_effect = detach_listener
-        runtime.manager.close = AsyncMock(side_effect=close_manager)
-        runtime.client.close = AsyncMock(side_effect=close_client)
         entry.runtime_data = runtime
+        hass = _hass()
+        hass.config_entries.async_unload_platforms = AsyncMock(return_value=False)
+
+        assert await async_unload_entry(hass, entry) is False
+
+        assert entry.runtime_data is runtime
+        runtime.listener.detach.assert_not_called()
+        for child in runtime.agents.values():
+            child.async_close.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_unload_detaches_once_and_closes_every_child_before_raising(self):
+        entry = _entry()
+        hass = _hass()
+        cleanup_error = RuntimeError("first child failed")
+        first = MagicMock()
+        first.async_close = AsyncMock(side_effect=cleanup_error)
+        second = MagicMock()
+        second.async_close = AsyncMock()
+        listener = MagicMock()
+        entry.runtime_data = MagicMock(
+            listener=listener,
+            agents={"first": first, "second": second},
+        )
 
         with pytest.raises(RuntimeError) as raised:
             await async_unload_entry(hass, entry)
 
-        assert raised.value is expected_error
-        assert order == ["listener", "manager", "client"]
+        assert raised.value is cleanup_error
+        listener.detach.assert_called_once_with()
+        first.async_close.assert_awaited_once_with()
+        second.async_close.assert_awaited_once_with()
+        assert entry.runtime_data is None
 
     @pytest.mark.asyncio
-    async def test_unload_order_is_listener_then_manager_then_client(self):
-        hass = MagicMock()
-        hass.config_entries.async_forward_entry_setups = AsyncMock()
-        hass.config_entries.async_unload_platforms = AsyncMock(return_value=True)
-        entry = _entry()
-        order: list[str] = []
-        with patch("custom_components.casa.CasaApiClient") as mock_cls, \
-             patch("custom_components.casa.SessionRegistrationListener") as mock_listener, \
-             patch("custom_components.casa.SatelliteDirectory"), \
-             patch("custom_components.casa.BackgroundDeliveryManager") as mock_manager:
-            client_inst = MagicMock()
-            client_inst.health_check = AsyncMock(return_value=True)
-            client_inst.start_background = AsyncMock()
+    async def test_unload_cancels_all_registration_tasks_and_listener(self):
+        butler = _subentry("butler", "Tina", subentry_id="child-butler")
+        concierge = _subentry("concierge", "Gary", subentry_id="child-concierge")
+        entry = _entry(butler, concierge)
+        hass = _hass()
+        clients = _ClientHarness(_catalog("butler", "Tina", "concierge", "Gary"))
+        managers = _ManagerHarness()
+        started = [asyncio.Event(), asyncio.Event()]
+        cancelled = [asyncio.Event(), asyncio.Event()]
 
-            async def close_client():
-                order.append("client")
+        with patch("custom_components.casa.CasaApiClient", side_effect=clients), \
+             patch(
+                 "custom_components.casa.BackgroundDeliveryManager",
+                 side_effect=managers,
+             ), \
+             patch(
+                 "custom_components.casa.SessionRegistrationListener",
+             ) as listener_cls:
+            assert await async_setup_entry(hass, entry) is True
 
-            async def close_manager():
-                order.append("manager")
+            for index, client in enumerate(clients.children):
+                async def blocked_registration(_index=index, **_kwargs):
+                    started[_index].set()
+                    try:
+                        await asyncio.Event().wait()
+                    except asyncio.CancelledError:
+                        cancelled[_index].set()
+                        raise
 
-            client_inst.close = AsyncMock(side_effect=close_client)
-            mock_listener.return_value.detach.side_effect = lambda: order.append("listener")
-            mock_manager.return_value.close = AsyncMock(side_effect=close_manager)
-            mock_cls.return_value = client_inst
-            await async_setup_entry(hass, entry)
-            ok = await async_unload_entry(hass, entry)
-            assert ok is True
-            mock_listener.return_value.detach.assert_called_once()
-            mock_manager.return_value.close.assert_awaited_once()
-            client_inst.close.assert_awaited_once()
-            assert order == ["listener", "manager", "client"]
+                client.register_session = AsyncMock(side_effect=blocked_registration)
 
-    @pytest.mark.asyncio
-    async def test_unload_cancels_supervisor_so_no_reconnect_occurs_afterward(self):
-        hass = MagicMock()
-        hass.config_entries.async_forward_entry_setups = AsyncMock()
-        hass.config_entries.async_unload_platforms = AsyncMock(return_value=True)
-        entry = _entry()
-        client = _SupervisedClient()
-        with patch("custom_components.casa.CasaApiClient", return_value=client), \
-             patch("custom_components.casa.SessionRegistrationListener"), \
-             patch("custom_components.casa.SatelliteDirectory"), \
-             patch("custom_components.casa.BackgroundDeliveryManager") as mock_manager:
-            mock_manager.return_value.close = AsyncMock()
-            await async_setup_entry(hass, entry)
-            await client.pulse_reconnect()
-            assert client.reconnect_attempts_for_test == 1
+            listener_cls.call_args.kwargs["on_listening"]("dev-kitchen")
+            await asyncio.gather(*(event.wait() for event in started))
+            runtime = entry.runtime_data
 
-            await async_unload_entry(hass, entry)
-            await client.pulse_reconnect()
+            assert await async_unload_entry(hass, entry) is True
 
-            assert client.reconnect_attempts_for_test == 1
-            assert client._supervisor is None
+        listener_cls.return_value.detach.assert_called_once_with()
+        assert all(event.is_set() for event in cancelled)
+        assert all(
+            child.registration_task_count_for_test == 0
+            for child in runtime.agents.values()
+        )
+        assert entry.runtime_data is None

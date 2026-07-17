@@ -14,8 +14,9 @@ INTEGRATION_VERSION = json.loads(
 CONF_HOST = "host"
 CONF_PORT = "port"
 CONF_WEBHOOK_SECRET = "webhook_secret"
+CONF_ROLE = "role"
+CONF_AGENT_NAME = "name"
 
-CONF_AGENT_ROLE = "agent_role"
 CONF_IDLE_STABILITY_MS = "idle_stability_ms"
 CONF_SATELLITE_ENTITY_OVERRIDES = "satellite_entity_overrides"
 CONF_SESSION_MODE = "session_mode"
@@ -29,7 +30,6 @@ TRANSPORT_WS = "ws"
 TRANSPORT_SSE = "sse"
 
 DEFAULT_PORT = 18065
-DEFAULT_AGENT_ROLE = "butler"
 DEFAULT_IDLE_STABILITY_MS = 750
 DEFAULT_SATELLITE_ENTITY_OVERRIDES = "{}"
 DEFAULT_SESSION_MODE = SESSION_MODE_DEVICE
@@ -42,10 +42,15 @@ WS_RECONNECT_MIN = 1
 WS_RECONNECT_MAX = 30
 VOICE_ROUTE_PROTOCOL = 1
 VOICE_ROUTE_CAPABILITIES = ("background_jobs", "satellite_announce")
+VOICE_AGENT_CATALOG_SCHEMA_VERSION = 1
+MAX_VOICE_AGENTS = 20
+MAX_VOICE_AGENT_NAME_LENGTH = 128
+SUBENTRY_TYPE_AGENT = "voice_agent"
 
 SSE_PATH = "/api/converse"
 WS_PATH = "/api/converse/ws"
 HEALTH_PATH = "/healthz"
+VOICE_AGENTS_PATH = "/api/voice/agents"
 
 FALLBACK = "Sorry, I'm having trouble. Please try again."
 SILENT_STREAM_FALLBACK = "I'm here — could you say that again?"

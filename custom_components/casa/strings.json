@@ -4,7 +4,11 @@
       "user": {
         "title": "Casa",
         "description": "Connect to your Casa add-on.",
-        "data": {"host": "Host", "port": "Port", "webhook_secret": "Webhook secret"}
+        "data": {
+          "host": "Host",
+          "port": "Port",
+          "webhook_secret": "Webhook secret"
+        }
       },
       "hassio_confirm": {
         "title": "Casa add-on discovered",
@@ -12,11 +16,14 @@
       },
       "reauth_confirm": {
         "title": "Reauthenticate Casa",
-        "data": {"webhook_secret": "Webhook secret"}
+        "data": {
+          "webhook_secret": "Webhook secret"
+        }
       }
     },
     "error": {
       "invalid_auth": "Invalid webhook secret.",
+      "invalid_catalog": "Casa returned an invalid voice-agent catalog. Check Casa's enabled ha_voice agent names and configuration.",
       "cannot_connect": "Cannot reach the Casa add-on.",
       "unknown": "Unexpected error."
     },
@@ -29,24 +36,46 @@
     "step": {
       "init": {
         "data": {
-          "agent_role": "Agent role",
-          "idle_stability_ms": "Assist idle stability (milliseconds)",
-          "satellite_entity_overrides": "Satellite entity overrides (JSON)",
-          "session_mode": "Session scope",
-          "transport": "Transport"
+          "satellite_entity_overrides": "Satellite entity overrides (JSON)"
         },
         "data_description": {
-          "agent_role": "Which Casa agent handles conversations (e.g. 'butler', 'assistant')",
-          "idle_stability_ms": "Debounces brief Assist follow-up gaps before an announcement (0–5000 ms). A device that is already stably idle is not delayed.",
-          "satellite_entity_overrides": "Optional JSON object mapping Home Assistant device IDs to assist_satellite entity IDs when a device has multiple satellites.",
-          "session_mode": "How memory scope is derived: per device, per user, or per conversation",
-          "transport": "Prefer WebSocket (enables barge-in and voice session registration) or SSE (stateless fallback)"
+          "satellite_entity_overrides": "Usually leave this empty. Configure it only when one Home Assistant device has multiple assist_satellite entities and Casa cannot determine where to speak a queued result. For example, map device ID abc123 to assist_satellite.kitchen_voice; results originating from abc123 will then play on that kitchen satellite. Without an override, Casa safely declines an ambiguous announcement rather than speaking on the wrong device."
         }
       }
     },
     "error": {
-      "invalid_idle_stability": "Enter a whole number from 0 to 5000.",
       "invalid_satellite_entity_overrides": "Enter a JSON object whose assist_satellite entities are currently bound to the matching device IDs."
+    }
+  },
+  "config_subentries": {
+    "voice_agent": {
+      "title": "Casa voice agent",
+      "entry_type": "Casa voice agent",
+      "initiate_flow": {
+        "user": "Voice agents are discovered from Casa automatically"
+      },
+      "step": {
+        "reconfigure": {
+          "title": "Configure voice agent",
+          "data": {
+            "session_mode": "Session scope",
+            "transport": "Transport",
+            "idle_stability_ms": "Assist idle stability (milliseconds)"
+          },
+          "data_description": {
+            "session_mode": "How memory scope is derived: per device, per user, or per conversation.",
+            "transport": "Prefer WebSocket for voice session registration and background results, or use SSE as a stateless fallback.",
+            "idle_stability_ms": "How long Casa waits after the voice assistant becomes idle before speaking a queued specialist result. This prevents Gary from interrupting an active conversation or follow-up. If the device is already idle, the result is spoken immediately. Default: 750 ms."
+          }
+        }
+      },
+      "error": {
+        "invalid_idle_stability": "Enter a whole number from 0 to 5000."
+      },
+      "abort": {
+        "catalog_managed": "Voice agents are discovered from Casa and cannot be added manually.",
+        "reconfigure_successful": "Voice-agent settings updated."
+      }
     }
   }
 }
