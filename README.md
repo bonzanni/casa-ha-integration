@@ -1,12 +1,16 @@
 # Casa HA Integration
 
-Companion custom integration that routes Home Assistant's Assist pipeline through the [Casa add-on](https://github.com/bonzanni/casa-ha-app) — a multi-agent AI assistant built around Claude. Ships streaming TTS deltas, voice session registration via `assist_satellite` state listening, and a "never silent" error path.
+Companion custom integration that routes Home Assistant's Assist pipeline through the [Casa add-on](https://github.com/bonzanni/casa-ha-app) — a multi-agent AI assistant built around Claude. It ships streaming TTS deltas, voice session registration via `assist_satellite` state listening, a "never silent" error path, and acknowledgement-gated delivery of completed background specialist jobs.
 
 ## Requirements
 
 - Home Assistant Core 2026.4 or newer.
 - Casa add-on running and reachable on the local network.
 - HACS (Home Assistant Community Store) installed.
+
+Casa authenticates the WebSocket with HMAC, which provides peer authentication
+and message integrity but does not encrypt its payload. Keep the Casa-to-Home
+Assistant connection on a trusted LAN, private network, or encrypted tunnel.
 
 ## Install
 
@@ -22,14 +26,42 @@ Companion custom integration that routes Home Assistant's Assist pipeline throug
 Open the integration **Configure** panel to change:
 
 - **Agent role** — which Casa agent handles turns. Default: `butler`.
+- **Assist idle stability** — how long an Assist satellite must remain idle
+  before queued background audio starts (0–5000 ms; default: 750 ms). A
+  satellite that was already stably idle is not delayed.
+- **Satellite entity overrides** — optional JSON device-to-entity bindings for
+  devices that expose more than one `assist_satellite` entity.
 - **Session mode** — how memory scope is derived: `device` (default), `user`, `conversation`.
-- **Transport** — `ws` (default, enables barge-in + voice session registration) or `sse` (stateless fallback).
+- **Transport** — `ws` (default, enables barge-in, registration, and negotiated
+  background delivery) or `sse` (stateless synchronous fallback).
+
+## Background specialist delivery
+
+With WebSocket transport, the integration eagerly registers a protocol-1 route
+and advertises `background_jobs` plus `satellite_announce`. Background delivery
+is enabled only after Casa acknowledges both capabilities on that exact socket
+generation. Old Casa releases do not acknowledge the registration, so the
+integration remains `background_capable=false` while ordinary synchronous Tina
+and Gary turns continue unchanged.
+
+Completed work is queued per satellite. If the satellite is already idle it is
+announced immediately; otherwise the integration waits for the current voice
+interaction to finish and for the configured stable-idle interval. Queues are
+FIFO per device, while different devices can progress independently. A user may
+cancel before playback starts; playback already underway is not interrupted.
+
+Casa is the sole durable job owner. The integration keeps only an in-memory
+stable-job dedupe set. Delivery is therefore intentionally at least once: if
+the announcement succeeds but the connection drops before Casa receives the
+delivered acknowledgement, the concise summary may be repeated after a later
+restart or reconnect rather than being silently lost.
 
 ## E2E checklist
 
-Run end-to-end against a real HA + Casa add-on before tagging a release. Last verified
-2026-07-11 against HA Core 2026.6.4, HACS 2.0.5, and Casa add-on 0.65.2 — all steps green
-(steps 2/4 exercised at the protocol/log level rather than with live satellite audio).
+Run end-to-end against a real HA + Casa add-on before tagging a release. The
+legacy synchronous matrix was last verified 2026-07-11 against HA Core 2026.6.4,
+HACS 2.0.5, and Casa add-on 0.65.2. The 0.3.0 background path remains dark until
+its separate live Voice PE acceptance matrix is completed.
 
 1. HACS install completes. Config flow accepts valid secret; rejects invalid secret with the `Invalid webhook secret` error.
 2. Assign Casa Butler as pipeline conversation agent. Voice turn from a satellite flows STT → Casa → TTS with audible butler reply.
@@ -38,6 +70,10 @@ Run end-to-end against a real HA + Casa add-on before tagging a release. Last ve
 5. Disconnect Casa mid-conversation. Satellite speaks the fallback line, HA does not go silent, reconnect recovers without integration reload.
 6. Switch **Transport** to `sse` via Options. Integration reloads. One full turn works (no session registration, expected).
 7. Change the webhook secret on Casa without updating HA. Next turn triggers reauth; entering the new secret restores normal operation.
+8. Against a protocol-1 Casa route, complete one background job while the
+   satellite is busy and verify it is announced only after stable idle. Drop
+   the WebSocket before the delivered acknowledgement and verify replay is
+   possible but loss is not.
 
 ## Architecture
 
