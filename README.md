@@ -8,9 +8,11 @@ Companion custom integration that routes Home Assistant's Assist pipeline throug
 - Casa add-on running and reachable on the local network.
 - HACS (Home Assistant Community Store) installed.
 
-Casa authenticates the WebSocket with HMAC, which provides peer authentication
-and message integrity but does not encrypt its payload. Keep the Casa-to-Home
-Assistant connection on a trusted LAN, private network, or encrypted tunnel.
+Casa checks an HMAC of the empty HTTP upgrade body to authenticate the
+integration client when the WebSocket is established. That handshake does not
+authenticate individual frames, and plain `ws://` provides no encryption or
+cryptographic server authentication. Keep the Casa-to-Home Assistant
+connection on a trusted LAN, private network, or encrypted tunnel.
 
 ## Install
 
@@ -50,11 +52,14 @@ interaction to finish and for the configured stable-idle interval. Queues are
 FIFO per device, while different devices can progress independently. A user may
 cancel before playback starts; playback already underway is not interrupted.
 
-Casa is the sole durable job owner. The integration keeps only an in-memory
-stable-job dedupe set. Delivery is therefore intentionally at least once: if
-the announcement succeeds but the connection drops before Casa receives the
-delivered acknowledgement, the concise summary may be repeated after a later
-restart or reconnect rather than being silently lost.
+Casa is the sole durable job owner. The integration records completed job IDs
+in a bounded, process-local delivered cache before it sends the acknowledgement.
+An ordinary WebSocket reconnect keeps the same manager and cache, so a reoffer
+is claimed and acknowledged without repeating the audio. Delivery remains
+intentionally at least once: if the announcement succeeds but its delivered
+acknowledgement is lost, the concise summary may repeat after a manager or
+integration process restart, or after delivered-cache eviction, rather than
+being silently lost.
 
 ## E2E checklist
 
@@ -72,8 +77,10 @@ its separate live Voice PE acceptance matrix is completed.
 7. Change the webhook secret on Casa without updating HA. Next turn triggers reauth; entering the new secret restores normal operation.
 8. Against a protocol-1 Casa route, complete one background job while the
    satellite is busy and verify it is announced only after stable idle. Drop
-   the WebSocket before the delivered acknowledgement and verify replay is
-   possible but loss is not.
+   the WebSocket before the delivered acknowledgement and verify an ordinary
+   reconnect claims and acknowledges the reoffer without replay. Repeat with
+   an integration restart before the reoffer and verify the summary may replay
+   once but is never silently lost.
 
 ## Architecture
 

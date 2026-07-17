@@ -694,7 +694,7 @@ class TestPerDeviceWorkers:
             if frame["delivery_attempt_id"] == "attempt-2"
         ] == ["job_claimed", "job_delivered"]
 
-    async def test_successful_audio_is_cached_before_delivered_write_failure(
+    async def test_ack_loss_reconnect_same_manager_reclaims_without_audio_replay(
         self, delivery_manager,
     ):
         manager, clock = delivery_manager
@@ -719,6 +719,61 @@ class TestPerDeviceWorkers:
         assert [
             frame["type"] for frame in manager.client.sent
             if frame["delivery_attempt_id"] == "attempt-2"
+        ] == ["job_claimed", "job_delivered"]
+
+    async def test_ack_loss_after_manager_restart_replays_once_without_loss(
+        self, delivery_manager,
+    ):
+        manager, clock = delivery_manager
+        manager.directory.set_state("dev-k", "idle", changed_at=clock.now - 10)
+
+        async def lose_first_delivered_ack(frame):
+            if (
+                frame["type"] == "job_delivered"
+                and frame["delivery_attempt_id"] == "attempt-1"
+            ):
+                raise ConnectionError("PRIVATE_CONNECTION_CANARY")
+
+        manager.client.on_send = lose_first_delivered_ack
+        await manager.handle_frame(job_ready("job-1", attempt_id="attempt-1"))
+        await manager.drain_for_test()
+        await manager.close()
+
+        replacement_client = FakeClient()
+        replacement = BackgroundDeliveryManager(
+            manager.hass,
+            replacement_client,
+            route_id="entry-1",
+            directory=manager.directory,
+            idle_stability_ms=750,
+            clock=clock,
+        )
+        replacement_client.manager = replacement
+        try:
+            await replacement.handle_frame(
+                job_ready("job-1", attempt_id="attempt-2"),
+            )
+            await replacement.drain_for_test()
+            await replacement.handle_frame(
+                job_ready("job-1", attempt_id="attempt-3"),
+            )
+            await replacement.drain_for_test()
+        finally:
+            await replacement.close()
+
+        assert manager.hass.services.async_call.await_count == 2
+        assert [
+            frame["type"] for frame in replacement_client.sent
+            if frame["delivery_attempt_id"] == "attempt-2"
+        ] == [
+            "job_claimed",
+            "job_delivery_start",
+            "job_playback_started",
+            "job_delivered",
+        ]
+        assert [
+            frame["type"] for frame in replacement_client.sent
+            if frame["delivery_attempt_id"] == "attempt-3"
         ] == ["job_claimed", "job_delivered"]
 
     async def test_delivered_lru_is_bounded_to_exactly_256_ids(self, delivery_manager):
