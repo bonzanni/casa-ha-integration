@@ -14,6 +14,7 @@ from custom_components.casa.api import (
     AuthenticationError,
     BlockFrame,
     CasaApiClient,
+    ConnectionState,
     DoneFrame,
     ErrorFrame,
 )
@@ -357,6 +358,32 @@ class _FakeWSMsg:
         self.data = data
 
 
+def _ws_auth_error() -> aiohttp.WSServerHandshakeError:
+    return aiohttp.WSServerHandshakeError(
+        request_info=MagicMock(),
+        history=(),
+        status=401,
+        message="Unauthorized",
+    )
+
+
+class _SessionFailOnceThenConnect:
+    def __init__(self) -> None:
+        self.ws = _FakeWS(stay_open=True)
+        self.connect_count = 0
+        self._second_connect = asyncio.Event()
+
+    async def ws_connect(self, *_args, **_kwargs):
+        self.connect_count += 1
+        if self.connect_count == 1:
+            raise ConnectionError("temporarily offline")
+        self._second_connect.set()
+        return self.ws
+
+    async def wait_until_second_connect(self) -> None:
+        await asyncio.wait_for(self._second_connect.wait(), timeout=1)
+
+
 async def _wait_until(predicate, *, timeout: float = 1) -> None:
     async with asyncio.timeout(timeout):
         while not predicate():
@@ -554,6 +581,596 @@ class TestClose:
         assert ws.closed is True
 
 
+class TestConnectionState:
+    @pytest.mark.asyncio
+    async def test_current_socket_notifies_connected_then_disconnected(self):
+        states: list[ConnectionState] = []
+        session = MagicMock()
+        ws = _FakeWS(stay_open=True)
+        session.ws_connect = AsyncMock(return_value=ws)
+        client = CasaApiClient(
+            session=session,
+            host="h",
+            port=1,
+            webhook_secret="secret",
+            state_callback=states.append,
+        )
+
+        assert client.connected is False
+        assert states == []
+
+        await client._ensure_ws()
+        assert client.connected is True
+        assert states == [ConnectionState.CONNECTED]
+
+        ws.disconnect()
+        await _wait_until(lambda: not client.connected)
+        assert states == [
+            ConnectionState.CONNECTED,
+            ConnectionState.DISCONNECTED,
+        ]
+        await client.close()
+
+    @pytest.mark.asyncio
+    async def test_registration_failure_never_emits_connected(self):
+        states: list[ConnectionState] = []
+        session = MagicMock()
+        ws = _FakeWS(stay_open=True)
+        ws.send_json = AsyncMock(side_effect=ConnectionError("register failed"))
+        session.ws_connect = AsyncMock(return_value=ws)
+        client = CasaApiClient(
+            session=session,
+            host="h",
+            port=1,
+            webhook_secret="secret",
+            state_callback=states.append,
+        )
+        client._route_id = "parent:butler"
+        client._route_agent_role = "butler"
+
+        with pytest.raises(ConnectionError, match="register failed"):
+            await client._ensure_ws()
+
+        assert states == []
+        assert client.connected is False
+        await client.close()
+
+    @pytest.mark.asyncio
+    async def test_socket_closed_during_registration_never_emits_connected(self):
+        states: list[ConnectionState] = []
+        session = MagicMock()
+        ws = _FakeWS(stay_open=True)
+
+        async def close_during_registration(frame):
+            ws.sent.append(frame)
+            ws.closed = True
+
+        ws.send_json = close_during_registration
+        session.ws_connect = AsyncMock(return_value=ws)
+        client = CasaApiClient(
+            session=session,
+            host="h",
+            port=1,
+            webhook_secret="secret",
+            state_callback=states.append,
+        )
+        client._route_id = "parent:butler"
+        client._route_agent_role = "butler"
+
+        with pytest.raises(ConnectionError, match="no longer active"):
+            await client._ensure_ws()
+
+        assert states == []
+        assert client.connected is False
+        await client.close()
+
+    @pytest.mark.asyncio
+    async def test_reader_cannot_clear_generation_before_connected_transition(self):
+        states: list[ConnectionState] = []
+        session = MagicMock()
+        ws = _FakeWS(stay_open=True)
+        session.ws_connect = AsyncMock(return_value=ws)
+        client = CasaApiClient(
+            session=session,
+            host="h",
+            port=1,
+            webhook_secret="secret",
+            state_callback=states.append,
+        )
+        write_lock = client._ws_write_lock
+        exit_count = 0
+
+        class DisconnectAfterValidation:
+            async def __aenter__(self):
+                await write_lock.acquire()
+
+            async def __aexit__(self, *_exc_info):
+                nonlocal exit_count
+                write_lock.release()
+                exit_count += 1
+                if exit_count == 2:
+                    ws.disconnect()
+                    await _wait_until(lambda: client._ws is None)
+
+        client._ws_write_lock = DisconnectAfterValidation()
+
+        await client._ensure_ws()
+
+        assert states == [
+            ConnectionState.CONNECTED,
+            ConnectionState.DISCONNECTED,
+        ]
+        assert client.connected is False
+        await client.close()
+
+    @pytest.mark.asyncio
+    async def test_background_reconnect_notifies_connected_again(self):
+        states: list[ConnectionState] = []
+        session = MagicMock()
+        first = _FakeWS(stay_open=True)
+        second = _FakeWS(stay_open=True)
+        session.ws_connect = AsyncMock(side_effect=[first, second])
+        client = CasaApiClient(
+            session=session,
+            host="h",
+            port=1,
+            webhook_secret="secret",
+            state_callback=states.append,
+        )
+
+        try:
+            await client.start_background(
+                route_id="parent:butler",
+                agent_role="butler",
+                job_handler=AsyncMock(),
+            )
+            first.disconnect()
+            await _wait_until(lambda: session.ws_connect.await_count == 2)
+            await _wait_until(lambda: client.connected)
+
+            assert states == [
+                ConnectionState.CONNECTED,
+                ConnectionState.DISCONNECTED,
+                ConnectionState.CONNECTED,
+            ]
+        finally:
+            await client.close()
+
+    @pytest.mark.asyncio
+    async def test_handshake_401_notifies_auth_failed_and_escapes_startup(self):
+        states: list[ConnectionState] = []
+        session = MagicMock()
+        session.ws_connect = AsyncMock(side_effect=_ws_auth_error())
+        client = CasaApiClient(
+            session=session,
+            host="h",
+            port=1,
+            webhook_secret="secret",
+            state_callback=states.append,
+        )
+
+        with pytest.raises(AuthenticationError):
+            await client.start_background(
+                route_id="parent:butler",
+                agent_role="butler",
+                job_handler=AsyncMock(),
+            )
+
+        assert states == [
+            ConnectionState.AUTH_FAILED,
+        ]
+        assert client.connected is False
+        assert client._ws_supervisor is None
+        assert session.ws_connect.await_count == 1
+        await client.close()
+
+    @pytest.mark.asyncio
+    async def test_auth_failed_client_cannot_reconnect(self):
+        states: list[ConnectionState] = []
+        session = MagicMock()
+        session.ws_connect = AsyncMock(
+            side_effect=[_ws_auth_error(), _FakeWS(stay_open=True)],
+        )
+        client = CasaApiClient(
+            session=session,
+            host="h",
+            port=1,
+            webhook_secret="secret",
+            state_callback=states.append,
+        )
+
+        try:
+            with pytest.raises(AuthenticationError):
+                await client._ensure_ws()
+            with pytest.raises(AuthenticationError):
+                await client._ensure_ws()
+
+            assert session.ws_connect.await_count == 1
+            assert states == [ConnectionState.AUTH_FAILED]
+            assert client.connected is False
+        finally:
+            await client.close()
+
+    @pytest.mark.asyncio
+    async def test_auth_failed_client_rejects_later_ws_stream(self):
+        states: list[ConnectionState] = []
+        session = MagicMock()
+        session.ws_connect = AsyncMock(
+            side_effect=[_ws_auth_error(), _FakeWS(stay_open=True, auto_done=True)],
+        )
+        client = CasaApiClient(
+            session=session,
+            host="h",
+            port=1,
+            webhook_secret="secret",
+            state_callback=states.append,
+        )
+
+        try:
+            with pytest.raises(AuthenticationError):
+                await client._ensure_ws()
+            stream = client.stream_utterance(
+                text="hello",
+                agent_role="butler",
+                scope_id="scope-1",
+                utterance_id="utterance-1",
+                context={},
+            )
+            with pytest.raises(AuthenticationError):
+                await anext(stream)
+            await stream.aclose()
+
+            assert session.ws_connect.await_count == 1
+            assert states == [ConnectionState.AUTH_FAILED]
+            assert client.connected is False
+        finally:
+            await client.close()
+
+    @pytest.mark.asyncio
+    async def test_prior_generation_cleanup_cannot_overwrite_auth_failed(self):
+        states: list[ConnectionState] = []
+        session = MagicMock()
+        first = _FakeWS(stay_open=True)
+        session.ws_connect = AsyncMock(side_effect=[first, _ws_auth_error()])
+        client = CasaApiClient(
+            session=session,
+            host="h",
+            port=1,
+            webhook_secret="secret",
+            state_callback=states.append,
+        )
+
+        try:
+            await client._ensure_ws()
+            first_reader = client._ws_reader
+            first.closed = True
+
+            with pytest.raises(AuthenticationError):
+                await client._ensure_ws()
+            assert states == [
+                ConnectionState.CONNECTED,
+                ConnectionState.AUTH_FAILED,
+            ]
+
+            first.disconnect()
+            await asyncio.wait_for(first_reader, timeout=1)
+
+            assert states == [
+                ConnectionState.CONNECTED,
+                ConnectionState.AUTH_FAILED,
+            ]
+            assert client.connected is False
+        finally:
+            await client.close()
+
+    @pytest.mark.asyncio
+    async def test_supervisor_stops_when_reconnect_authentication_fails(
+        self,
+        monkeypatch,
+    ):
+        import custom_components.casa.api as api_mod
+
+        states: list[ConnectionState] = []
+        sleep = AsyncMock()
+        monkeypatch.setattr(api_mod, "_sleep", sleep)
+        session = MagicMock()
+        ws = _FakeWS(stay_open=True)
+        session.ws_connect = AsyncMock(side_effect=[ws, _ws_auth_error()])
+        client = CasaApiClient(
+            session=session,
+            host="h",
+            port=1,
+            webhook_secret="secret",
+            state_callback=states.append,
+        )
+
+        try:
+            await client.start_background(
+                route_id="parent:butler",
+                agent_role="butler",
+                job_handler=AsyncMock(),
+            )
+            ws.disconnect()
+            await _wait_until(
+                lambda: (
+                    client._ws_supervisor is not None
+                    and client._ws_supervisor.done()
+                ),
+            )
+
+            assert states == [
+                ConnectionState.CONNECTED,
+                ConnectionState.DISCONNECTED,
+                ConnectionState.AUTH_FAILED,
+            ]
+            assert session.ws_connect.await_count == 2
+        finally:
+            await client.close()
+
+        sleep.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_stale_generation_cannot_change_connection_state(self):
+        states: list[ConnectionState] = []
+        session = MagicMock()
+        first = _FakeWS(stay_open=True)
+        second = _FakeWS(stay_open=True)
+        session.ws_connect = AsyncMock(side_effect=[first, second])
+        client = CasaApiClient(
+            session=session,
+            host="h",
+            port=1,
+            webhook_secret="secret",
+            state_callback=states.append,
+        )
+
+        try:
+            await client._ensure_ws()
+            first_reader = client._ws_reader
+            first.closed = True
+            await client._ensure_ws()
+            first.disconnect()
+            await asyncio.wait_for(first_reader, timeout=1)
+
+            assert client.connected is True
+            assert states == [ConnectionState.CONNECTED]
+        finally:
+            await client.close()
+
+    @pytest.mark.asyncio
+    async def test_cleared_generation_cannot_disconnect_new_connection(self):
+        states: list[ConnectionState] = []
+        session = MagicMock()
+        first = _FakeWS(stay_open=True)
+        second = _FakeWS(stay_open=True)
+        session.ws_connect = AsyncMock(side_effect=[first, second])
+        client = CasaApiClient(
+            session=session,
+            host="h",
+            port=1,
+            webhook_secret="secret",
+            state_callback=states.append,
+        )
+
+        await client._ensure_ws()
+        first_reader = client._ws_reader
+        write_lock = client._ws_write_lock
+        cleanup_released = asyncio.Event()
+        resume_cleanup = asyncio.Event()
+
+        class PauseAfterCleanupRelease:
+            async def __aenter__(self):
+                await write_lock.acquire()
+
+            async def __aexit__(self, *_exc_info):
+                pause_cleanup = (
+                    client._ws is None and not cleanup_released.is_set()
+                )
+                write_lock.release()
+                if pause_cleanup:
+                    cleanup_released.set()
+                    await resume_cleanup.wait()
+
+        client._ws_write_lock = PauseAfterCleanupRelease()
+
+        try:
+            first.disconnect()
+            await asyncio.wait_for(cleanup_released.wait(), timeout=1)
+            await client._ensure_ws()
+            resume_cleanup.set()
+            await asyncio.wait_for(first_reader, timeout=1)
+
+            assert states == [
+                ConnectionState.CONNECTED,
+                ConnectionState.DISCONNECTED,
+                ConnectionState.CONNECTED,
+            ]
+            assert client.connected is True
+        finally:
+            resume_cleanup.set()
+            await client.close()
+
+    @pytest.mark.asyncio
+    async def test_no_state_callbacks_after_close(self):
+        states: list[ConnectionState] = []
+        session = MagicMock()
+        ws = _FakeWS(stay_open=True)
+        session.ws_connect = AsyncMock(return_value=ws)
+        client = CasaApiClient(
+            session=session,
+            host="h",
+            port=1,
+            webhook_secret="secret",
+            state_callback=states.append,
+        )
+        await client._ensure_ws()
+
+        await client.close()
+        states_after_close = list(states)
+        client._notify_connection_state(ConnectionState.CONNECTED)
+        ws.disconnect()
+        await asyncio.sleep(0)
+
+        assert states == states_after_close
+        assert states[-1] is ConnectionState.DISCONNECTED
+        assert client.connected is False
+
+    @pytest.mark.asyncio
+    async def test_callback_failure_is_swallowed_without_sensitive_details(
+        self,
+        caplog,
+    ):
+        canary = "PRIVATE_STATE_CALLBACK_EXCEPTION"
+
+        def failing_callback(_state):
+            raise RuntimeError(canary)
+
+        session = MagicMock()
+        ws = _FakeWS(stay_open=True)
+        session.ws_connect = AsyncMock(return_value=ws)
+
+        with caplog.at_level(logging.ERROR, logger="custom_components.casa.api"):
+            client = CasaApiClient(
+                session=session,
+                host="h",
+                port=1,
+                webhook_secret="secret",
+                state_callback=failing_callback,
+            )
+            await client._ensure_ws()
+            await client.close()
+
+        assert "Casa connection state callback failed" in caplog.text
+        assert canary not in caplog.text
+        assert all(record.exc_info is None for record in caplog.records)
+
+    @pytest.mark.asyncio
+    async def test_background_supervisor_survives_initial_network_failure(self):
+        session = _SessionFailOnceThenConnect()
+        states: list[ConnectionState] = []
+        client = CasaApiClient(
+            session=session,
+            host="h",
+            port=1,
+            webhook_secret="secret",
+            state_callback=states.append,
+        )
+
+        try:
+            await client.start_background(
+                route_id="parent:butler",
+                agent_role="butler",
+                job_handler=AsyncMock(),
+            )
+            await session.wait_until_second_connect()
+            await _wait_until(lambda: client.connected)
+
+            assert client.connected is True
+            assert states == [ConnectionState.CONNECTED]
+        finally:
+            await client.close()
+
+    @pytest.mark.asyncio
+    async def test_initial_network_failure_logs_safe_retry_breadcrumb(self, caplog):
+        canary = "PRIVATE_INITIAL_CONNECTION_FAILURE"
+        secret = "PRIVATE_WEBHOOK_SECRET"
+        host = "private-host-canary"
+        session = MagicMock()
+        session.ws_connect = AsyncMock(side_effect=ConnectionError(canary))
+
+        with caplog.at_level(logging.DEBUG, logger="custom_components.casa.api"):
+            client = CasaApiClient(
+                session=session,
+                host=host,
+                port=1,
+                webhook_secret=secret,
+            )
+            await client.start_background(
+                route_id="parent:butler",
+                agent_role="butler",
+                job_handler=AsyncMock(),
+            )
+            await client.close()
+
+        assert "Casa background WebSocket startup failed; retry scheduled" in caplog.text
+        assert canary not in caplog.text
+        assert secret not in caplog.text
+        assert host not in caplog.text
+        assert all(record.exc_info is None for record in caplog.records)
+
+    @pytest.mark.asyncio
+    async def test_close_racing_eager_connect_stops_startup_without_callback(self):
+        states: list[ConnectionState] = []
+        connect_started = asyncio.Event()
+        release_connect = asyncio.Event()
+        ws = _FakeWS(stay_open=True)
+        session = MagicMock()
+
+        async def blocked_connect(*_args, **_kwargs):
+            connect_started.set()
+            await release_connect.wait()
+            return ws
+
+        session.ws_connect = AsyncMock(side_effect=blocked_connect)
+        client = CasaApiClient(
+            session=session,
+            host="h",
+            port=1,
+            webhook_secret="secret",
+            state_callback=states.append,
+        )
+        startup = asyncio.create_task(client.start_background(
+            route_id="parent:butler",
+            agent_role="butler",
+            job_handler=AsyncMock(),
+        ))
+        await asyncio.wait_for(connect_started.wait(), timeout=1)
+
+        await client.close()
+        release_connect.set()
+
+        with pytest.raises(RuntimeError, match="closed"):
+            await startup
+        assert states == []
+        assert client._ws_supervisor is None
+        assert ws.closed is True
+
+    @pytest.mark.asyncio
+    async def test_close_racing_eager_failure_does_not_start_supervisor(self):
+        states: list[ConnectionState] = []
+        connect_started = asyncio.Event()
+        release_connect = asyncio.Event()
+        session = MagicMock()
+
+        async def blocked_connect(*_args, **_kwargs):
+            connect_started.set()
+            await release_connect.wait()
+            raise ConnectionError("temporarily offline")
+
+        session.ws_connect = AsyncMock(side_effect=blocked_connect)
+        client = CasaApiClient(
+            session=session,
+            host="h",
+            port=1,
+            webhook_secret="secret",
+            state_callback=states.append,
+        )
+        startup = asyncio.create_task(client.start_background(
+            route_id="parent:butler",
+            agent_role="butler",
+            job_handler=AsyncMock(),
+        ))
+        await asyncio.wait_for(connect_started.wait(), timeout=1)
+
+        await client.close()
+        release_connect.set()
+
+        with pytest.raises(RuntimeError, match="closed"):
+            await startup
+        assert states == []
+        assert client._ws_supervisor is None
+
+
 class TestBackgroundDelivery:
     @pytest.mark.asyncio
     async def test_start_background_eagerly_connects_and_registers(self):
@@ -576,6 +1193,132 @@ class TestBackgroundDelivery:
             "capabilities": ["background_jobs", "satellite_announce"],
         }
         await client.close()
+
+    @pytest.mark.asyncio
+    async def test_start_background_registers_an_existing_socket(self):
+        session = MagicMock()
+        ws = _FakeWS(stay_open=True)
+        session.ws_connect = AsyncMock(return_value=ws)
+        client = CasaApiClient(session=session, host="h", port=1, webhook_secret="sec")
+
+        await client._ensure_ws()
+        assert ws.sent == []
+
+        await client.start_background(
+            route_id="entry-1",
+            agent_role="concierge",
+            job_handler=AsyncMock(),
+        )
+
+        assert session.ws_connect.await_count == 1
+        assert ws.sent == [{
+            "type": "voice_route_register",
+            "protocol": 1,
+            "route_id": "entry-1",
+            "agent_role": "concierge",
+            "capabilities": ["background_jobs", "satellite_announce"],
+        }]
+        await client.close()
+
+    @pytest.mark.asyncio
+    async def test_existing_socket_registration_failure_reconnects(self):
+        states: list[ConnectionState] = []
+        session = MagicMock()
+        first = _FakeWS(stay_open=True)
+        second = _FakeWS(stay_open=True)
+        session.ws_connect = AsyncMock(side_effect=[first, second])
+        client = CasaApiClient(
+            session=session,
+            host="h",
+            port=1,
+            webhook_secret="sec",
+            state_callback=states.append,
+        )
+
+        try:
+            await client._ensure_ws()
+            first.send_json = AsyncMock(
+                side_effect=ConnectionError("route registration failed"),
+            )
+
+            await client.start_background(
+                route_id="entry-1",
+                agent_role="concierge",
+                job_handler=AsyncMock(),
+            )
+
+            assert first.closed is True
+            assert client.connected is False
+            assert states == [
+                ConnectionState.CONNECTED,
+                ConnectionState.DISCONNECTED,
+            ]
+
+            await _wait_until(lambda: session.ws_connect.await_count == 2)
+            await _wait_until(lambda: client.connected)
+            assert second.sent == [{
+                "type": "voice_route_register",
+                "protocol": 1,
+                "route_id": "entry-1",
+                "agent_role": "concierge",
+                "capabilities": ["background_jobs", "satellite_announce"],
+            }]
+            assert states == [
+                ConnectionState.CONNECTED,
+                ConnectionState.DISCONNECTED,
+                ConnectionState.CONNECTED,
+            ]
+        finally:
+            await client.close()
+
+    @pytest.mark.asyncio
+    async def test_live_supervisor_survives_registration_reader_retirement(self):
+        states: list[ConnectionState] = []
+        session = MagicMock()
+        first = _FakeWS(stay_open=True)
+        second = _FakeWS(stay_open=True)
+        session.ws_connect = AsyncMock(side_effect=[first, second])
+        client = CasaApiClient(
+            session=session,
+            host="h",
+            port=1,
+            webhook_secret="sec",
+            state_callback=states.append,
+        )
+
+        try:
+            await client._ensure_ws()
+            first.send_json = AsyncMock(
+                side_effect=ConnectionError("route registration failed"),
+            )
+            supervisor = asyncio.create_task(client._supervise_ws())
+            client._ws_supervisor = supervisor
+            await asyncio.sleep(0)
+
+            await client.start_background(
+                route_id="entry-1",
+                agent_role="concierge",
+                job_handler=AsyncMock(),
+            )
+
+            assert client._ws_supervisor is supervisor
+            await _wait_until(lambda: session.ws_connect.await_count == 2)
+            await _wait_until(lambda: client.connected)
+            assert supervisor.done() is False
+            assert second.sent == [{
+                "type": "voice_route_register",
+                "protocol": 1,
+                "route_id": "entry-1",
+                "agent_role": "concierge",
+                "capabilities": ["background_jobs", "satellite_announce"],
+            }]
+            assert states == [
+                ConnectionState.CONNECTED,
+                ConnectionState.DISCONNECTED,
+                ConnectionState.CONNECTED,
+            ]
+        finally:
+            await client.close()
 
     @pytest.mark.asyncio
     async def test_old_casa_no_ack_keeps_sync_ws_and_disables_jobs(self):

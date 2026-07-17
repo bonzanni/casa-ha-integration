@@ -9,6 +9,7 @@ import json
 import logging
 from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass
+from enum import StrEnum
 from typing import Any
 
 import aiohttp
@@ -59,6 +60,14 @@ class AuthenticationError(Exception):
     """Raised when Casa returns 401."""
 
 
+class ConnectionState(StrEnum):
+    """Availability state of this client's WebSocket connection."""
+
+    DISCONNECTED = "disconnected"
+    CONNECTED = "connected"
+    AUTH_FAILED = "auth_failed"
+
+
 class CasaApiClient:
     """Async client for Casa add-on (SSE + WS)."""
 
@@ -68,6 +77,7 @@ class CasaApiClient:
         host: str,
         port: int,
         webhook_secret: str,
+        state_callback: Callable[[ConnectionState], None] | None = None,
     ) -> None:
         self._session = session
         self._base_url = f"http://{host}:{port}"
@@ -88,8 +98,43 @@ class CasaApiClient:
         self._route_ack_generation: int | None = None
         self._accepted_capabilities: frozenset[str] = frozenset()
         self._job_handler: Callable[[dict], Awaitable[None]] | None = None
+        self._state_callback = state_callback
+        self._connection_state = ConnectionState.DISCONNECTED
         self._closed = False
         self._reconnect_attempts = 0
+
+    @property
+    def connected(self) -> bool:
+        """Whether this client owns a current connected socket generation."""
+        return (
+            not self._closed
+            and self._connection_state is ConnectionState.CONNECTED
+        )
+
+    def _notify_connection_state(
+        self,
+        state: ConnectionState,
+        *,
+        allow_closed: bool = False,
+    ) -> None:
+        """Publish a changed state without letting callbacks affect transport."""
+        if self._closed and not allow_closed:
+            return
+        if (
+            state is ConnectionState.DISCONNECTED
+            and self._connection_state is ConnectionState.AUTH_FAILED
+            and not allow_closed
+        ):
+            return
+        if self._connection_state is state:
+            return
+        self._connection_state = state
+        if self._state_callback is None:
+            return
+        try:
+            self._state_callback(state)
+        except Exception:
+            _LOGGER.error("Casa connection state callback failed")
 
     @property
     def background_capable(self) -> bool:
@@ -228,6 +273,8 @@ class CasaApiClient:
         async with self._ws_lock:
             if self._closed:
                 raise RuntimeError("Casa API client is closed")
+            if self._connection_state is ConnectionState.AUTH_FAILED:
+                raise AuthenticationError("Invalid webhook secret")
             if self._ws is not None and not self._ws.closed:
                 return self._ws
             headers = {"X-Webhook-Signature": self._sign(b"")}
@@ -237,6 +284,7 @@ class CasaApiClient:
                 )
             except aiohttp.WSServerHandshakeError as err:
                 if err.status == 401:
+                    self._notify_connection_state(ConnectionState.AUTH_FAILED)
                     raise AuthenticationError("Invalid webhook secret") from err
                 raise
             if self._closed:
@@ -260,6 +308,17 @@ class CasaApiClient:
             try:
                 if self._route_id is not None:
                     await self._register_voice_route(ws, generation)
+                async with self._ws_write_lock:
+                    if (
+                        self._closed
+                        or self._ws is not ws
+                        or self._ws_generation != generation
+                        or ws.closed
+                    ):
+                        raise ConnectionError(
+                            "Casa WebSocket generation is no longer active",
+                        )
+                    self._notify_connection_state(ConnectionState.CONNECTED)
             except BaseException:
                 reader.cancel()
                 await asyncio.gather(reader, return_exceptions=True)
@@ -272,6 +331,9 @@ class CasaApiClient:
                         self._route_ack.clear()
                         self._route_ack_generation = None
                         self._accepted_capabilities = frozenset()
+                        self._notify_connection_state(
+                            ConnectionState.DISCONNECTED,
+                        )
                 raise
             return ws
 
@@ -326,6 +388,34 @@ class CasaApiClient:
         }, ws=ws, generation=generation)
         self._registered_generation = generation
 
+    async def _retire_ws_generation(
+        self,
+        ws: aiohttp.ClientWebSocketResponse,
+        generation: int,
+    ) -> None:
+        """Retire an exact failed generation so supervision can reconnect."""
+        reader: asyncio.Task | None = None
+        async with self._ws_write_lock:
+            if self._ws is not ws or self._ws_generation != generation:
+                return
+            self._ws = None
+            reader = self._ws_reader
+            self._ws_reader = None
+            self._registered_generation = None
+            self._route_ack.clear()
+            self._route_ack_generation = None
+            self._accepted_capabilities = frozenset()
+            self._notify_connection_state(ConnectionState.DISCONNECTED)
+
+        if reader is not None and reader is not asyncio.current_task():
+            reader.cancel()
+            await asyncio.gather(reader, return_exceptions=True)
+        if not ws.closed:
+            try:
+                await ws.close()
+            except Exception:
+                _LOGGER.debug("Casa WebSocket retirement close failed")
+
     async def _supervise_ws(self) -> None:
         """Reconnect a configured background route until the client closes."""
         while not self._closed:
@@ -334,10 +424,15 @@ class CasaApiClient:
                 try:
                     await reader
                 except asyncio.CancelledError:
-                    raise
+                    current = asyncio.current_task()
+                    if current is None or current.cancelling():
+                        raise
                 except Exception:
                     _LOGGER.debug("Casa WebSocket reader failed")
-            if self._closed:
+            if (
+                self._closed
+                or self._connection_state is ConnectionState.AUTH_FAILED
+            ):
                 return
 
             self._reconnect_attempts += 1
@@ -345,6 +440,9 @@ class CasaApiClient:
                 await self._ensure_ws()
             except asyncio.CancelledError:
                 raise
+            except AuthenticationError:
+                self._notify_connection_state(ConnectionState.AUTH_FAILED)
+                return
             except Exception:
                 if self._closed:
                     return
@@ -396,6 +494,9 @@ class CasaApiClient:
                     self._route_ack.clear()
                     self._route_ack_generation = None
                     self._accepted_capabilities = frozenset()
+                    self._notify_connection_state(
+                        ConnectionState.DISCONNECTED,
+                    )
             for (queue_generation, _), queue in list(self._ws_queues.items()):
                 if queue_generation == generation:
                     await queue.put({"type": "__closed__"})
@@ -489,9 +590,23 @@ class CasaApiClient:
         self._route_id = route_id
         self._route_agent_role = agent_role
         self._job_handler = job_handler
-        ws = await self._ensure_ws()
-        generation = self._ws_generation
-        await self._register_voice_route(ws, generation)
+        ws: aiohttp.ClientWebSocketResponse | None = None
+        generation: int | None = None
+        try:
+            ws = await self._ensure_ws()
+            generation = self._ws_generation
+            await self._register_voice_route(ws, generation)
+        except AuthenticationError:
+            raise
+        except (aiohttp.ClientError, OSError, asyncio.TimeoutError):
+            if not self._closed:
+                _LOGGER.debug(
+                    "Casa background WebSocket startup failed; retry scheduled",
+                )
+            if ws is not None and generation is not None:
+                await self._retire_ws_generation(ws, generation)
+        if self._closed:
+            raise RuntimeError("Casa API client is closed")
         if self._ws_supervisor is None or self._ws_supervisor.done():
             self._ws_supervisor = asyncio.create_task(self._supervise_ws())
 
@@ -526,6 +641,10 @@ class CasaApiClient:
 
     async def close(self) -> None:
         self._closed = True
+        self._notify_connection_state(
+            ConnectionState.DISCONNECTED,
+            allow_closed=True,
+        )
         ws = self._ws
         supervisor = self._ws_supervisor
         reader = self._ws_reader
