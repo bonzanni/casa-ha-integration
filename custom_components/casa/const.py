@@ -36,6 +36,8 @@ TIMEOUT_TOTAL = 30
 TIMEOUT_HEALTH = 5
 WS_RECONNECT_MIN = 1
 WS_RECONNECT_MAX = 30
+VOICE_ROUTE_PROTOCOL = 1
+VOICE_ROUTE_CAPABILITIES = ("background_jobs", "satellite_announce")
 
 SSE_PATH = "/api/converse"
 WS_PATH = "/api/converse/ws"

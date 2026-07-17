@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from unittest.mock import AsyncMock, MagicMock
 
@@ -137,7 +138,8 @@ class TestStreamUtteranceSSE:
         assert call[0][0].endswith("/api/converse")
         body = call.kwargs["data"]
         headers = call.kwargs["headers"]
-        import hashlib, hmac as _hmac
+        import hashlib
+        import hmac as _hmac
         expected = _hmac.new(b"s3cret", body, hashlib.sha256).hexdigest()
         assert headers["X-Webhook-Signature"] == expected
         parsed = json.loads(body)
@@ -161,24 +163,52 @@ class TestStreamUtteranceSSE:
 
 
 class _FakeWS:
-    def __init__(self, outgoing=None):
+    _CLOSED = object()
+
+    def __init__(self, outgoing=None, *, stay_open: bool = False, auto_done: bool = False):
         self.sent: list[dict] = []
         self._outgoing = list(outgoing or [])
+        self._incoming: asyncio.Queue = asyncio.Queue()
+        self._stay_open = stay_open
+        self._auto_done = auto_done
         self.closed = False
+        self.concurrent_send = 0
+        self.max_concurrent_send = 0
 
     async def send_json(self, data):
-        self.sent.append(data)
+        self.concurrent_send += 1
+        self.max_concurrent_send = max(self.max_concurrent_send, self.concurrent_send)
+        try:
+            # Make overlapping writers observable to the concurrency test.
+            await asyncio.sleep(0)
+            self.sent.append(data)
+            if self._auto_done and data.get("type") == "utterance":
+                self.feed_json({"type": "done", "utterance_id": data["utterance_id"]})
+        finally:
+            self.concurrent_send -= 1
 
     async def close(self):
         self.closed = True
+        self._incoming.put_nowait(self._CLOSED)
+
+    def feed_json(self, frame: dict) -> None:
+        self._incoming.put_nowait(_FakeWSMsg("TEXT", json.dumps(frame)))
+
+    def disconnect(self) -> None:
+        self.closed = True
+        self._incoming.put_nowait(self._CLOSED)
 
     def __aiter__(self):
         return self
 
     async def __anext__(self):
-        if not self._outgoing:
+        if self._outgoing:
+            return self._outgoing.pop(0)
+        if not self._stay_open:
             raise StopAsyncIteration
-        msg = self._outgoing.pop(0)
+        msg = await self._incoming.get()
+        if msg is self._CLOSED:
+            raise StopAsyncIteration
         return msg
 
 
@@ -186,6 +216,30 @@ class _FakeWSMsg:
     def __init__(self, type_name: str, data: str = ""):
         self.type = type("T", (), {"name": type_name})()
         self.data = data
+
+
+async def _wait_until(predicate, *, timeout: float = 1) -> None:
+    async with asyncio.timeout(timeout):
+        while not predicate():
+            await asyncio.sleep(0)
+
+
+async def _collect_ws_utterance(
+    client: CasaApiClient,
+    *,
+    utterance_id: str = "u-1",
+) -> list:
+    return [
+        frame
+        async for frame in client.stream_utterance(
+            text="hello",
+            agent_role="concierge",
+            scope_id="dev-1",
+            utterance_id=utterance_id,
+            context={},
+            transport="ws",
+        )
+    ]
 
 
 class TestStreamUtteranceWS:
@@ -215,7 +269,8 @@ class TestStreamUtteranceWS:
         ):
             frames.append(f)
 
-        import hashlib, hmac as _hmac
+        import hashlib
+        import hmac as _hmac
         expected = _hmac.new(b"sec", b"", hashlib.sha256).hexdigest()
         assert captured["headers"]["X-Webhook-Signature"] == expected
         assert captured["url"].endswith("/api/converse/ws")
@@ -298,7 +353,7 @@ class TestWsCancel:
                 "type": "block", "utterance_id": "u", "text": "hi", "final": False,
             })),
             # intentionally no "done" — we cancel mid-stream.
-        ])
+        ], stay_open=True)
         session.ws_connect = AsyncMock(return_value=ws)
         client = api_mod.CasaApiClient(session=session, host="h", port=1, webhook_secret="sec")
 
@@ -323,18 +378,23 @@ class TestSessionRegistration:
         ws = _FakeWS(outgoing=[])
         session.ws_connect = AsyncMock(return_value=ws)
         client = api_mod.CasaApiClient(session=session, host="h", port=1, webhook_secret="sec")
-        await client.register_session(scope_id="dev-1", transport="ws")
+        await client.register_session(
+            scope_id="dev-1", transport="ws", agent_role="concierge",
+        )
         sent = [s for s in ws.sent if s.get("type") == "stt_start"]
         assert sent
         assert sent[0]["scope_id"] == "dev-1"
         assert sent[0]["session_key"] == "voice:dev-1"
+        assert sent[0]["agent_role"] == "concierge"
 
     @pytest.mark.asyncio
     async def test_sse_registration_noops(self, api_client: CasaApiClient, mock_session: MagicMock):
         # SSE transport: registration must return without raising and without any network call.
         mock_session.post = AsyncMock()
         mock_session.ws_connect = AsyncMock()
-        await api_client.register_session(scope_id="dev-1", transport="sse")
+        await api_client.register_session(
+            scope_id="dev-1", transport="sse", agent_role="concierge",
+        )
         mock_session.post.assert_not_called()
         mock_session.ws_connect.assert_not_called()
 
@@ -350,3 +410,455 @@ class TestClose:
         await client._ensure_ws()
         await client.close()
         assert ws.closed is True
+
+
+class TestBackgroundDelivery:
+    @pytest.mark.asyncio
+    async def test_start_background_eagerly_connects_and_registers(self):
+        session = MagicMock()
+        ws = _FakeWS(stay_open=True)
+        session.ws_connect = AsyncMock(return_value=ws)
+        client = CasaApiClient(session=session, host="h", port=1, webhook_secret="sec")
+
+        await client.start_background(
+            route_id="entry-1",
+            agent_role="concierge",
+            job_handler=AsyncMock(),
+        )
+
+        assert ws.sent[0] == {
+            "type": "voice_route_register",
+            "protocol": 1,
+            "route_id": "entry-1",
+            "agent_role": "concierge",
+            "capabilities": ["background_jobs", "satellite_announce"],
+        }
+        await client.close()
+
+    @pytest.mark.asyncio
+    async def test_old_casa_no_ack_keeps_sync_ws_and_disables_jobs(self):
+        session = MagicMock()
+        ws = _FakeWS(stay_open=True)
+        session.ws_connect = AsyncMock(return_value=ws)
+        client = CasaApiClient(session=session, host="h", port=1, webhook_secret="sec")
+
+        await client.start_background(
+            route_id="entry-1",
+            agent_role="concierge",
+            job_handler=AsyncMock(),
+        )
+        await asyncio.sleep(0)
+
+        assert client.background_capable is False
+        assert ws.closed is False
+        assert client.reconnect_attempts_for_test == 0
+
+        utterance = asyncio.create_task(_collect_ws_utterance(client))
+        await _wait_until(lambda: any(frame.get("type") == "utterance" for frame in ws.sent))
+        ws.feed_json({"type": "done", "utterance_id": "u-1"})
+        frames = await utterance
+        assert [frame.kind for frame in frames] == ["done"]
+        await client.close()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("ack", "expected"),
+        [
+            (
+                {
+                    "type": "voice_route_registered",
+                    "protocol": 1,
+                    "accepted_capabilities": ["background_jobs", "satellite_announce"],
+                },
+                True,
+            ),
+            (
+                {
+                    "type": "voice_route_registered",
+                    "protocol": "1",
+                    "accepted_capabilities": ["background_jobs", "satellite_announce"],
+                },
+                False,
+            ),
+            (
+                {
+                    "type": "voice_route_registered",
+                    "protocol": 1,
+                    "accepted_capabilities": ["background_jobs"],
+                },
+                False,
+            ),
+        ],
+    )
+    async def test_only_protocol_one_ack_with_both_capabilities_enables_jobs(
+        self, ack, expected,
+    ):
+        session = MagicMock()
+        ws = _FakeWS(stay_open=True)
+        session.ws_connect = AsyncMock(return_value=ws)
+        client = CasaApiClient(session=session, host="h", port=1, webhook_secret="sec")
+        await client.start_background(
+            route_id="entry-1", agent_role="concierge", job_handler=AsyncMock(),
+        )
+
+        ws.feed_json(ack)
+        await _wait_until(lambda: client._route_ack.is_set())
+
+        assert client.background_capable is expected
+        await client.close()
+
+    @pytest.mark.asyncio
+    async def test_job_frames_are_demuxed_before_utterance_ids(self):
+        session = MagicMock()
+        ws = _FakeWS(stay_open=True)
+        session.ws_connect = AsyncMock(return_value=ws)
+        handler = AsyncMock()
+        client = CasaApiClient(session=session, host="h", port=1, webhook_secret="sec")
+        await client.start_background(
+            route_id="entry-1", agent_role="concierge", job_handler=handler,
+        )
+        ws.feed_json({
+            "type": "voice_route_registered",
+            "protocol": 1,
+            "accepted_capabilities": ["background_jobs", "satellite_announce"],
+        })
+        await _wait_until(lambda: client.background_capable)
+
+        utterance = asyncio.create_task(_collect_ws_utterance(client))
+        await _wait_until(lambda: any(frame.get("type") == "utterance" for frame in ws.sent))
+        job = {
+            "type": "job_ready",
+            "protocol": 1,
+            "job_id": "job-1",
+            "delivery_attempt_id": "attempt-1",
+        }
+        ws.feed_json(job)
+        ws.feed_json({
+            "type": "block",
+            "utterance_id": "u-1",
+            "text": "spoken response",
+            "final": True,
+        })
+        ws.feed_json({"type": "done", "utterance_id": "u-1"})
+
+        frames = await utterance
+        handler.assert_awaited_once_with(job)
+        assert [frame.kind for frame in frames] == ["block", "done"]
+        assert frames[0].text == "spoken response"
+        await client.close()
+
+    @pytest.mark.asyncio
+    async def test_authorization_and_denial_frames_only_reach_job_handler(self):
+        session = MagicMock()
+        ws = _FakeWS(stay_open=True)
+        session.ws_connect = AsyncMock(return_value=ws)
+        received: list[dict] = []
+
+        async def handler(frame):
+            received.append(frame)
+
+        client = CasaApiClient(session=session, host="h", port=1, webhook_secret="sec")
+        await client.start_background(
+            route_id="entry-1", agent_role="concierge", job_handler=handler,
+        )
+        ws.feed_json({
+            "type": "voice_route_registered",
+            "protocol": 1,
+            "accepted_capabilities": ["background_jobs", "satellite_announce"],
+        })
+        await _wait_until(lambda: client.background_capable)
+
+        utterance = asyncio.create_task(_collect_ws_utterance(client))
+        await _wait_until(lambda: any(frame.get("type") == "utterance" for frame in ws.sent))
+        authorized = {
+            "type": "job_delivery_authorized",
+            "protocol": 1,
+            "job_id": "job-1",
+            "delivery_attempt_id": "attempt-1",
+            "utterance_id": "u-1",
+        }
+        denied = {
+            "type": "job_revoke",
+            "protocol": 1,
+            "job_id": "job-2",
+            "delivery_attempt_id": "attempt-2",
+            "utterance_id": "u-1",
+            "reason": "stale_attempt",
+        }
+        ws.feed_json(authorized)
+        ws.feed_json(denied)
+        ws.feed_json({"type": "done", "utterance_id": "u-1"})
+
+        frames = await utterance
+        assert received == [authorized, denied]
+        assert [frame.kind for frame in frames] == ["done"]
+        await client.close()
+
+    @pytest.mark.asyncio
+    async def test_job_handler_exception_does_not_log_sensitive_text(self, caplog):
+        session = MagicMock()
+        ws = _FakeWS(stay_open=True)
+        session.ws_connect = AsyncMock(return_value=ws)
+        handler_called = asyncio.Event()
+        sensitive = "private spoken result"
+
+        async def handler(_frame):
+            handler_called.set()
+            raise RuntimeError(sensitive)
+
+        client = CasaApiClient(session=session, host="h", port=1, webhook_secret="sec")
+        await client.start_background(
+            route_id="entry-1", agent_role="concierge", job_handler=handler,
+        )
+        ws.feed_json({
+            "type": "voice_route_registered",
+            "protocol": 1,
+            "accepted_capabilities": ["background_jobs", "satellite_announce"],
+        })
+        await _wait_until(lambda: client.background_capable)
+        ws.feed_json({
+            "type": "job_ready",
+            "protocol": 1,
+            "job_id": "job-1",
+            "delivery_attempt_id": "attempt-1",
+        })
+        await asyncio.wait_for(handler_called.wait(), timeout=1)
+        await _wait_until(lambda: bool(caplog.records))
+
+        assert sensitive not in caplog.text
+        assert "job_ready" in caplog.text
+        await client.close()
+
+    @pytest.mark.asyncio
+    async def test_all_ws_writes_share_one_global_writer(self):
+        session = MagicMock()
+        ws = _FakeWS(stay_open=True, auto_done=True)
+        session.ws_connect = AsyncMock(return_value=ws)
+        client = CasaApiClient(session=session, host="h", port=1, webhook_secret="sec")
+        await client.start_background(
+            route_id="entry-1", agent_role="concierge", job_handler=AsyncMock(),
+        )
+        ws.feed_json({
+            "type": "voice_route_registered",
+            "protocol": 1,
+            "accepted_capabilities": ["background_jobs", "satellite_announce"],
+        })
+        await _wait_until(lambda: client.background_capable)
+
+        await asyncio.gather(
+            client.register_session(
+                scope_id="dev-1", transport="ws", agent_role="concierge",
+            ),
+            _collect_ws_utterance(client),
+            client.send_job_frame({
+                "type": "job_claimed",
+                "protocol": 1,
+                "job_id": "job-1",
+                "delivery_attempt_id": "attempt-1",
+            }),
+        )
+
+        assert ws.max_concurrent_send == 1
+        await client.close()
+
+    @pytest.mark.asyncio
+    async def test_reconnect_registers_once_on_every_socket_generation(self):
+        session = MagicMock()
+        first = _FakeWS(stay_open=True)
+        second = _FakeWS(stay_open=True)
+        session.ws_connect = AsyncMock(side_effect=[first, second])
+        client = CasaApiClient(session=session, host="h", port=1, webhook_secret="sec")
+        await client.start_background(
+            route_id="entry-1", agent_role="concierge", job_handler=AsyncMock(),
+        )
+
+        first.disconnect()
+        await _wait_until(lambda: session.ws_connect.await_count == 2)
+        await _wait_until(lambda: len(second.sent) == 1)
+
+        assert [frame["type"] for frame in first.sent] == ["voice_route_register"]
+        assert [frame["type"] for frame in second.sent] == ["voice_route_register"]
+        assert client.reconnect_attempts_for_test == 1
+        await client.close()
+
+    @pytest.mark.asyncio
+    async def test_old_generation_closes_only_its_utterance_queues(self):
+        session = MagicMock()
+        first = _FakeWS(stay_open=True)
+        second = _FakeWS(stay_open=True)
+        session.ws_connect = AsyncMock(side_effect=[first, second])
+        client = CasaApiClient(session=session, host="h", port=1, webhook_secret="sec")
+        old_utterance = asyncio.create_task(_collect_ws_utterance(client))
+        await _wait_until(lambda: any(frame.get("type") == "utterance" for frame in first.sent))
+
+        # Install generation 2 before generation 1's reader reaches cleanup.
+        first.closed = True
+        await client._ensure_ws()
+        first.disconnect()
+
+        frames = await asyncio.wait_for(old_utterance, timeout=1)
+        assert len(frames) == 1
+        assert frames[0].kind == "error"
+        assert frames[0].kind_ == "connection"
+        await client.close()
+
+    @pytest.mark.asyncio
+    async def test_cancel_never_crosses_socket_generations(self):
+        session = MagicMock()
+        first = _FakeWS(outgoing=[
+            _FakeWSMsg("TEXT", json.dumps({
+                "type": "block", "utterance_id": "u-1", "text": "hi", "final": False,
+            })),
+        ], stay_open=True)
+        second = _FakeWS(stay_open=True)
+        session.ws_connect = AsyncMock(side_effect=[first, second])
+        client = CasaApiClient(session=session, host="h", port=1, webhook_secret="sec")
+        utterance = client.stream_utterance(
+            text="hello",
+            agent_role="concierge",
+            scope_id="dev-1",
+            utterance_id="u-1",
+            context={},
+            transport="ws",
+        )
+        assert (await utterance.__anext__()).text == "hi"
+
+        first.closed = True
+        await client._ensure_ws()
+        await utterance.aclose()
+
+        assert not any(frame.get("type") == "cancel" for frame in second.sent)
+        await client.close()
+
+    @pytest.mark.asyncio
+    async def test_reconnect_backoff_grows_caps_and_resets_after_upgrade(self, monkeypatch):
+        import custom_components.casa.api as api_mod
+
+        delays: list[float] = []
+
+        async def fake_sleep(delay):
+            delays.append(delay)
+            await asyncio.sleep(0)
+
+        monkeypatch.setattr(api_mod, "_sleep", fake_sleep, raising=False)
+        session = MagicMock()
+        first = _FakeWS(stay_open=True)
+        second = _FakeWS(stay_open=True)
+        third = _FakeWS(stay_open=True)
+        session.ws_connect = AsyncMock(side_effect=[
+            first,
+            ConnectionError("offline-1"),
+            ConnectionError("offline-2"),
+            ConnectionError("offline-3"),
+            ConnectionError("offline-4"),
+            ConnectionError("offline-5"),
+            ConnectionError("offline-6"),
+            ConnectionError("offline-7"),
+            second,
+            ConnectionError("offline-after-upgrade"),
+            third,
+        ])
+        client = CasaApiClient(session=session, host="h", port=1, webhook_secret="sec")
+        await client.start_background(
+            route_id="entry-1", agent_role="concierge", job_handler=AsyncMock(),
+        )
+
+        first.disconnect()
+        await _wait_until(lambda: len(second.sent) == 1)
+        second.disconnect()
+        await _wait_until(lambda: len(third.sent) == 1)
+
+        assert delays == [1, 2, 4, 8, 16, 30, 30, 1]
+        await client.close()
+
+    @pytest.mark.asyncio
+    async def test_without_background_start_new_casa_still_accepts_sync_voice(self):
+        session = MagicMock()
+        ws = _FakeWS(outgoing=[
+            _FakeWSMsg("TEXT", json.dumps({"type": "done", "utterance_id": "u-1"})),
+        ])
+        session.ws_connect = AsyncMock(return_value=ws)
+        client = CasaApiClient(session=session, host="h", port=1, webhook_secret="sec")
+
+        frames = await _collect_ws_utterance(client)
+
+        assert [frame.kind for frame in frames] == ["done"]
+        assert [frame["type"] for frame in ws.sent] == ["utterance"]
+        await client.close()
+
+    @pytest.mark.asyncio
+    async def test_close_active_background_reader_prevents_reconnect(self):
+        session = MagicMock()
+        ws = _FakeWS(stay_open=True)
+        session.ws_connect = AsyncMock(return_value=ws)
+        client = CasaApiClient(session=session, host="h", port=1, webhook_secret="sec")
+        await client.start_background(
+            route_id="entry-1", agent_role="concierge", job_handler=AsyncMock(),
+        )
+
+        await client.close()
+        await asyncio.sleep(0)
+
+        assert ws.closed is True
+        assert session.ws_connect.await_count == 1
+        assert client.background_capable is False
+        assert client._ws_reader is None
+        assert client._ws_supervisor is None
+
+    @pytest.mark.asyncio
+    async def test_close_cancels_outstanding_authorization_handler_future(self):
+        session = MagicMock()
+        ws = _FakeWS(stay_open=True)
+        session.ws_connect = AsyncMock(return_value=ws)
+        handler_started = asyncio.Event()
+        authorization = asyncio.get_running_loop().create_future()
+
+        async def handler(_frame):
+            handler_started.set()
+            await authorization
+
+        client = CasaApiClient(session=session, host="h", port=1, webhook_secret="sec")
+        await client.start_background(
+            route_id="entry-1", agent_role="concierge", job_handler=handler,
+        )
+        ws.feed_json({
+            "type": "voice_route_registered",
+            "protocol": 1,
+            "accepted_capabilities": ["background_jobs", "satellite_announce"],
+        })
+        await _wait_until(lambda: client.background_capable)
+        ws.feed_json({
+            "type": "job_delivery_authorized",
+            "protocol": 1,
+            "job_id": "job-1",
+            "delivery_attempt_id": "attempt-1",
+        })
+        await asyncio.wait_for(handler_started.wait(), timeout=1)
+
+        await client.close()
+
+        assert authorization.cancelled()
+        assert client._ws_reader is None
+        assert client._ws_supervisor is None
+
+    @pytest.mark.asyncio
+    async def test_close_during_reconnect_backoff_stops_supervisor(self, monkeypatch):
+        import custom_components.casa.api as api_mod
+
+        monkeypatch.setattr(api_mod, "WS_RECONNECT_MIN", 0.05)
+        monkeypatch.setattr(api_mod, "WS_RECONNECT_MAX", 0.05)
+        session = MagicMock()
+        ws = _FakeWS(stay_open=True)
+        session.ws_connect = AsyncMock(side_effect=[ws, ConnectionError("offline")])
+        client = CasaApiClient(session=session, host="h", port=1, webhook_secret="sec")
+        await client.start_background(
+            route_id="entry-1", agent_role="concierge", job_handler=AsyncMock(),
+        )
+
+        ws.disconnect()
+        await _wait_until(lambda: session.ws_connect.await_count == 2)
+        await client.close()
+        await asyncio.sleep(0.06)
+
+        assert session.ws_connect.await_count == 2
+        assert client._ws_supervisor is None
