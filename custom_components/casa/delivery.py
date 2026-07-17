@@ -206,14 +206,15 @@ class BackgroundDeliveryManager:
             key = (delivery.job_id, delivery.attempt_id)
             if key in self._attempts:
                 return
-            try:
-                delivery.entity_id = self.directory.resolve(delivery.device_id)
-            except SatelliteAmbiguous:
-                self._spawn_send(self._frame(delivery, "job_nack", reason="satellite_ambiguous"))
-                return
-            except SatelliteNotFound:
-                self._spawn_send(self._frame(delivery, "job_nack", reason="satellite_not_found"))
-                return
+            if delivery.job_id not in self._delivered:
+                try:
+                    delivery.entity_id = self.directory.resolve(delivery.device_id)
+                except SatelliteAmbiguous:
+                    self._spawn_send(self._frame(delivery, "job_nack", reason="satellite_ambiguous"))
+                    return
+                except SatelliteNotFound:
+                    self._spawn_send(self._frame(delivery, "job_nack", reason="satellite_not_found"))
+                    return
             self._attempts[key] = delivery
             queue = self._queues.setdefault(delivery.device_id, asyncio.Queue())
             queue.put_nowait(delivery)

@@ -337,7 +337,9 @@ class TestStreamUtteranceWS:
         client = api_mod.CasaApiClient(session=session, host="h", port=1, webhook_secret="sec")
         async for _ in client.stream_utterance(
             text="hello", agent_role="butler", scope_id="dev-42",
-            utterance_id="u", context={"language": "en"}, transport="ws",
+            utterance_id="u",
+            context={"language": "en", "device_id": "origin-device"},
+            transport="ws",
         ):
             pass
         sent = ws.sent[0]
@@ -347,6 +349,7 @@ class TestStreamUtteranceWS:
         assert sent["agent_role"] == "butler"
         assert sent["scope_id"] == "dev-42"
         assert sent["context"]["language"] == "en"
+        assert sent["device_id"] == "origin-device"
 
 
 class TestWsCancel:

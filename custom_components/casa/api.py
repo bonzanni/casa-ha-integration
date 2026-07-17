@@ -404,14 +404,22 @@ class CasaApiClient:
         self._ws_queues[queue_key] = queue
         terminated = False
         try:
-            await self._send_json({
+            utterance = {
                 "type": "utterance",
                 "utterance_id": utterance_id,
                 "text": text,
                 "agent_role": agent_role,
                 "scope_id": scope_id,
                 "context": context,
-            }, ws=ws, generation=generation)
+            }
+            device_id = context.get("device_id")
+            if (
+                isinstance(device_id, str)
+                and device_id.strip()
+                and len(device_id) <= 512
+            ):
+                utterance["device_id"] = device_id
+            await self._send_json(utterance, ws=ws, generation=generation)
             while True:
                 frame = await queue.get()
                 t = frame.get("type")

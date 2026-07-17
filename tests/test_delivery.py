@@ -675,6 +675,25 @@ class TestPerDeviceWorkers:
             if frame["delivery_attempt_id"] == "attempt-2"
         ] == ["job_claimed", "job_delivered"]
 
+    async def test_delivered_reoffer_acks_after_satellite_mapping_disappears(
+        self, delivery_manager,
+    ):
+        manager, clock = delivery_manager
+        manager.directory.set_state("dev-k", "idle", changed_at=clock.now - 10)
+        await manager.handle_frame(job_ready("job-1", attempt_id="attempt-1"))
+        await manager.drain_for_test()
+        manager.directory.remove("assist_satellite.kitchen")
+
+        await manager.handle_frame(job_ready("job-1", attempt_id="attempt-2"))
+        await clock.settle()
+        await manager.drain_for_test()
+
+        manager.hass.services.async_call.assert_awaited_once()
+        assert [
+            frame["type"] for frame in manager.client.sent
+            if frame["delivery_attempt_id"] == "attempt-2"
+        ] == ["job_claimed", "job_delivered"]
+
     async def test_successful_audio_is_cached_before_delivered_write_failure(
         self, delivery_manager,
     ):
