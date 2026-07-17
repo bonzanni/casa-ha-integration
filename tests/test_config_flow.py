@@ -797,6 +797,9 @@ def test_catalog_and_subentry_copy(filename):
         CONF_IDLE_STABILITY_MS
     ] == CHILD_IDLE_DESCRIPTION
     assert "ha_voice" in content["config"]["error"]["invalid_catalog"]
+    assert content["config"]["abort"]["discovery_updated"] == (
+        "Casa connection details updated."
+    )
     assert "catalog_managed" in subentry_copy["abort"]
     assert "reconfigure_successful" in subentry_copy["abort"]
     assert "agent_role" not in json.dumps(content)
