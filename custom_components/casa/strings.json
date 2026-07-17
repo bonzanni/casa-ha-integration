@@ -39,7 +39,7 @@
           "satellite_entity_overrides": "Satellite entity overrides (JSON)"
         },
         "data_description": {
-          "satellite_entity_overrides": "Usually leave this as {}. Configure it only when one Home Assistant device has multiple assist_satellite entities and Casa cannot determine where to speak a queued result. Example: {\"abc123\":\"assist_satellite.kitchen_voice\"} makes results from device abc123 play on the kitchen voice satellite. Without an override, Casa safely declines an ambiguous announcement rather than speaking on the wrong device."
+          "satellite_entity_overrides": "Usually leave this empty. Configure it only when one Home Assistant device has multiple assist_satellite entities and Casa cannot determine where to speak a queued result. For example, map device ID abc123 to assist_satellite.kitchen_voice; results originating from abc123 will then play on that kitchen satellite. Without an override, Casa safely declines an ambiguous announcement rather than speaking on the wrong device."
         }
       }
     },
@@ -50,6 +50,10 @@
   "config_subentries": {
     "voice_agent": {
       "title": "Casa voice agent",
+      "entry_type": "Casa voice agent",
+      "initiate_flow": {
+        "user": "Voice agents are discovered from Casa automatically"
+      },
       "step": {
         "reconfigure": {
           "title": "Configure voice agent",

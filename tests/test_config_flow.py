@@ -655,13 +655,12 @@ class TestAgentSubentryFlow:
 
 
 PARENT_OVERRIDE_DESCRIPTION = (
-    "Usually leave this as {}. Configure it only when one Home Assistant device "
+    "Usually leave this empty. Configure it only when one Home Assistant device "
     "has multiple assist_satellite entities and Casa cannot determine where to "
-    "speak a queued result. Example: "
-    '{"abc123":"assist_satellite.kitchen_voice"} makes results from device '
-    "abc123 play on the kitchen voice satellite. Without an override, Casa "
-    "safely declines an ambiguous announcement rather than speaking on the "
-    "wrong device."
+    "speak a queued result. For example, map device ID abc123 to "
+    "assist_satellite.kitchen_voice; results originating from abc123 will then "
+    "play on that kitchen satellite. Without an override, Casa safely declines "
+    "an ambiguous announcement rather than speaking on the wrong device."
 )
 CHILD_IDLE_DESCRIPTION = (
     "How long Casa waits after the voice assistant becomes idle before speaking "
@@ -680,6 +679,10 @@ def test_catalog_and_subentry_copy(filename):
         CONF_SATELLITE_ENTITY_OVERRIDES
     ] == PARENT_OVERRIDE_DESCRIPTION
     subentry_copy = content["config_subentries"][SUBENTRY_TYPE_AGENT]
+    assert subentry_copy["entry_type"] == "Casa voice agent"
+    assert subentry_copy["initiate_flow"] == {
+        "user": "Voice agents are discovered from Casa automatically",
+    }
     assert subentry_copy["step"]["reconfigure"]["data_description"][
         CONF_IDLE_STABILITY_MS
     ] == CHILD_IDLE_DESCRIPTION
