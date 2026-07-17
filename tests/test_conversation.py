@@ -6,12 +6,14 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from custom_components.casa.api import BlockFrame, DoneFrame
+from custom_components.casa.api import (
+    AuthenticationError, BlockFrame, DoneFrame, ErrorFrame,
+)
 from custom_components.casa.conversation import CasaConversationEntity
 from custom_components.casa.const import (
     CONF_AGENT_ROLE, CONF_SESSION_MODE, CONF_TRANSPORT,
     DEFAULT_AGENT_ROLE, SESSION_MODE_DEVICE, SESSION_MODE_USER,
-    SESSION_MODE_CONVERSATION, TRANSPORT_WS,
+    FALLBACK, SESSION_MODE_CONVERSATION, SILENT_STREAM_FALLBACK, TRANSPORT_WS,
 )
 
 
@@ -96,7 +98,7 @@ class TestHandleMessageHappy:
 
         ui = _input(device_id="d-1")
         chat_log = _ChatLogCapture()
-        result = await ent._async_handle_message(ui, chat_log)
+        await ent._async_handle_message(ui, chat_log)
 
         assert len(chat_log.deltas) == 2
         assert chat_log.deltas[0]["role"] == "assistant"
@@ -126,10 +128,6 @@ class TestHandleMessageHappy:
         assert seen["context"]["conversation_id"] == "c-1"
         assert seen["transport"] == "ws"
         assert "utterance_id" in seen
-
-
-from custom_components.casa.api import ErrorFrame, AuthenticationError
-from custom_components.casa.const import FALLBACK, SILENT_STREAM_FALLBACK
 
 
 class TestHandleMessageErrors:
