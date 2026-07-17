@@ -7,18 +7,15 @@ side — the add-on no longer prewarms the memory overlay on ``stt_start``.
 
 from __future__ import annotations
 
-import logging
 import time
+from collections.abc import Callable
 from typing import Any
 
-from homeassistant.core import callback
+from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.event import TrackStates, async_track_state_change_filtered
 
-from .const import TRANSPORT_SSE
 from .delivery import SatelliteDirectory
-
-_LOGGER = logging.getLogger(__name__)
 
 
 class SessionRegistrationListener:
@@ -26,19 +23,14 @@ class SessionRegistrationListener:
 
     def __init__(
         self,
-        hass: Any,
-        client: Any,
-        transport: str,
+        hass: HomeAssistant,
         *,
-        agent_role: str,
         directory: SatelliteDirectory,
+        on_listening: Callable[[str], None],
     ) -> None:
         self._hass = hass
-        self._client = client
-        self._transport = transport
-        self._agent_role = agent_role
         self._directory = directory
-        self._logged_sse_noop = False
+        self._on_listening = on_listening
         self._tracker = None
         self._registry_unsubscribe = None
 
@@ -81,19 +73,7 @@ class SessionRegistrationListener:
         device_id = self._update_directory(new_state)
         if device_id is None or new_state.state != "listening":
             return
-        if self._transport == TRANSPORT_SSE:
-            if not self._logged_sse_noop:
-                _LOGGER.debug("Casa session registration state=skipped reason=sse_transport")
-                self._logged_sse_noop = True
-            return
-
-        self._hass.async_create_task(
-            self._client.register_session(
-                scope_id=device_id,
-                transport=self._transport,
-                agent_role=self._agent_role,
-            )
-        )
+        self._on_listening(device_id)
 
     @callback
     def handle_registry_update(self, event: Any) -> None:

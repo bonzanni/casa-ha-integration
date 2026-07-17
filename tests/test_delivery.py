@@ -205,6 +205,75 @@ class TestSatelliteDirectory:
         assert directory.idle_since("dev-k") == 11.0
 
 
+class TestManagerIsolation:
+    @pytest.mark.asyncio
+    async def test_same_device_and_job_ids_do_not_cross_agent_managers(self):
+        clock = FakeClock()
+        directory = SatelliteDirectory()
+        directory.add("dev-k", "assist_satellite.kitchen")
+        directory.set_state("dev-k", "idle", changed_at=clock.now - 10)
+        hass = MagicMock()
+        hass.services.async_call = AsyncMock()
+        butler_client = FakeClient()
+        concierge_client = FakeClient()
+        butler = BackgroundDeliveryManager(
+            hass,
+            butler_client,
+            route_id="entry-1:butler",
+            directory=directory,
+            clock=clock,
+        )
+        concierge = BackgroundDeliveryManager(
+            hass,
+            concierge_client,
+            route_id="entry-1:concierge",
+            directory=directory,
+            clock=clock,
+        )
+        butler_client.manager = butler
+        concierge_client.manager = concierge
+        butler_offer = job_ready(
+            "shared-job",
+            attempt_id="shared-attempt",
+            route_id="entry-1:butler",
+        )
+        concierge_offer = job_ready(
+            "shared-job",
+            attempt_id="shared-attempt",
+            route_id="entry-1:concierge",
+        )
+
+        try:
+            await concierge.handle_frame(butler_offer)
+            assert concierge_client.sent == []
+
+            await butler.handle_frame(butler_offer)
+            await concierge.handle_frame(concierge_offer)
+            await asyncio.gather(
+                butler.drain_for_test(),
+                concierge.drain_for_test(),
+            )
+
+            assert sent_types(butler_client) == [
+                "job_claimed",
+                "job_delivery_start",
+                "job_playback_started",
+                "job_delivered",
+            ]
+            assert sent_types(concierge_client) == [
+                "job_claimed",
+                "job_delivery_start",
+                "job_playback_started",
+                "job_delivered",
+            ]
+            assert butler.delivered_ids_for_test == frozenset({"shared-job"})
+            assert concierge.delivered_ids_for_test == frozenset({"shared-job"})
+            assert hass.services.async_call.await_count == 2
+        finally:
+            await butler.close()
+            await concierge.close()
+
+
 class TestStableIdleDelivery:
     async def test_already_stably_idle_announces_without_extra_750ms(
         self, delivery_manager,

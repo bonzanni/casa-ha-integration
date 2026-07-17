@@ -4,11 +4,10 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 
-from custom_components.casa.const import TRANSPORT_WS, TRANSPORT_SSE
 from custom_components.casa.delivery import SatelliteDirectory, SatelliteNotFound
 from custom_components.casa.registration import SessionRegistrationListener
 
@@ -59,29 +58,30 @@ def _registry_event(
     return SimpleNamespace(data=data)
 
 
-def _listener(hass, client, transport=TRANSPORT_WS, directory=None):
+def _listener(hass, on_listening=None, directory=None):
     return SessionRegistrationListener(
         hass,
-        client,
-        transport,
-        agent_role="concierge",
         directory=directory or SatelliteDirectory(),
+        on_listening=on_listening or MagicMock(),
     )
 
 
 class TestSessionRegistrationListener:
     def test_attach_tracks_assist_satellite_domain(self):
-        from homeassistant.helpers import event as ha_event
         from homeassistant.helpers import entity_registry as er
 
-        ha_event.async_track_state_change_filtered.reset_mock()
         er.EVENT_ENTITY_REGISTRY_UPDATED = "entity_registry_updated"
         hass = MagicMock()
         hass.states.async_all.return_value = []
         listener = _listener(hass, MagicMock())
-        listener.attach()
+        tracker = MagicMock()
+        with patch(
+            "custom_components.casa.registration.async_track_state_change_filtered",
+            return_value=tracker,
+        ) as track_state_changes:
+            listener.attach()
 
-        args = ha_event.async_track_state_change_filtered.call_args[0]
+        args = track_state_changes.call_args[0]
         track_states = args[1]
         assert track_states.all_states is False
         assert track_states.entities == set()
@@ -92,7 +92,6 @@ class TestSessionRegistrationListener:
             listener.handle_registry_update,
         )
 
-        tracker = ha_event.async_track_state_change_filtered.return_value
         registry_unsubscribe = hass.bus.async_listen.return_value
         listener.detach()
         tracker.async_remove.assert_called_once()
@@ -131,13 +130,9 @@ class TestSessionRegistrationListener:
         assert listener._tracker is None
         assert listener._registry_unsubscribe is None
 
-    @pytest.mark.asyncio
-    async def test_listening_registers_session_with_device_id(self):
+    def test_listening_calls_role_neutral_callback_once_with_device_id(self):
         hass = MagicMock()
-        hass.async_create_task = MagicMock()
-
-        client = MagicMock()
-        client.register_session = AsyncMock()
+        on_listening = MagicMock()
 
         from homeassistant.helpers import entity_registry as er
         entity_entry = MagicMock()
@@ -145,25 +140,18 @@ class TestSessionRegistrationListener:
         er.async_get = MagicMock(return_value=MagicMock(async_get=lambda _id: entity_entry))
 
         directory = SatelliteDirectory()
-        listener = _listener(hass, client, directory=directory)
+        listener = _listener(hass, on_listening, directory=directory)
         listener.handle(_state_change_event("assist_satellite.kitchen", "listening"))
 
-        # The coroutine should be submitted via async_create_task.
-        hass.async_create_task.assert_called_once()
-        coro = hass.async_create_task.call_args[0][0]
-        await coro
-        client.register_session.assert_awaited_once_with(
-            scope_id="dev-kitchen",
-            transport=TRANSPORT_WS,
-            agent_role="concierge",
-        )
+        on_listening.assert_called_once_with("dev-kitchen")
         assert directory.state("dev-kitchen") == "listening"
+        assert not hasattr(listener, "_client")
+        assert not hasattr(listener, "_transport")
+        assert not hasattr(listener, "_agent_role")
 
-    @pytest.mark.asyncio
-    async def test_tracks_non_listening_states_without_registering(self):
+    def test_tracks_non_listening_states_without_callback(self):
         hass = MagicMock()
-        hass.async_create_task = MagicMock()
-        client = MagicMock()
+        on_listening = MagicMock()
         directory = SatelliteDirectory()
 
         from homeassistant.helpers import entity_registry as er
@@ -172,46 +160,24 @@ class TestSessionRegistrationListener:
         registry.async_get = MagicMock(return_value=entity_entry)
         er.async_get = MagicMock(return_value=registry)
 
-        listener = _listener(hass, client, directory=directory)
+        listener = _listener(hass, on_listening, directory=directory)
         listener.handle(_state_change_event("assist_satellite.kitchen", "idle"))
         listener.handle(_state_change_event("assist_satellite.kitchen", "processing"))
-        hass.async_create_task.assert_not_called()
+        on_listening.assert_not_called()
         assert directory.state("dev-kitchen") == "processing"
         assert registry.async_get.call_count == 2
 
-    @pytest.mark.asyncio
-    async def test_ignores_non_satellite_domain(self):
+    def test_ignores_non_satellite_domain(self):
         hass = MagicMock()
-        hass.async_create_task = MagicMock()
-        client = MagicMock()
+        on_listening = MagicMock()
 
-        listener = _listener(hass, client)
+        listener = _listener(hass, on_listening)
         listener.handle(_state_change_event("light.kitchen", "listening", domain="light"))
-        hass.async_create_task.assert_not_called()
+        on_listening.assert_not_called()
 
-    @pytest.mark.asyncio
-    async def test_sse_transport_noops(self):
+    def test_missing_device_id_skips_callback(self):
         hass = MagicMock()
-        hass.async_create_task = MagicMock()
-        client = MagicMock()
-        client.register_session = AsyncMock()
-
-        from homeassistant.helpers import entity_registry as er
-        entity_entry = MagicMock()
-        entity_entry.device_id = "dev-kitchen"
-        er.async_get = MagicMock(return_value=MagicMock(async_get=lambda _id: entity_entry))
-
-        directory = SatelliteDirectory()
-        listener = _listener(hass, client, TRANSPORT_SSE, directory)
-        listener.handle(_state_change_event("assist_satellite.kitchen", "listening"))
-        hass.async_create_task.assert_not_called()
-        assert directory.state("dev-kitchen") == "listening"
-
-    @pytest.mark.asyncio
-    async def test_missing_device_id_skips(self):
-        hass = MagicMock()
-        hass.async_create_task = MagicMock()
-        client = MagicMock()
+        on_listening = MagicMock()
 
         from homeassistant.helpers import entity_registry as er
         entity_entry = MagicMock()
@@ -220,9 +186,9 @@ class TestSessionRegistrationListener:
 
         directory = SatelliteDirectory()
         directory.add("dev-old", "assist_satellite.kitchen")
-        listener = _listener(hass, client, directory=directory)
+        listener = _listener(hass, on_listening, directory=directory)
         listener.handle(_state_change_event("assist_satellite.kitchen", "listening"))
-        hass.async_create_task.assert_not_called()
+        on_listening.assert_not_called()
         with pytest.raises(SatelliteNotFound):
             directory.resolve("dev-old")
 
