@@ -11,11 +11,13 @@ import aiohttp
 import pytest
 
 from custom_components.casa.api import (
+    AuthenticationError,
     BlockFrame,
     CasaApiClient,
     DoneFrame,
     ErrorFrame,
 )
+from custom_components.casa.catalog import CatalogValidationError
 
 
 class TestCasaFrames:
@@ -61,6 +63,137 @@ class TestHealthCheck:
         mock_resp.status = 503
         mock_session.get = AsyncMock(return_value=mock_resp)
         assert await api_client.health_check() is False
+
+
+class TestFetchVoiceAgents:
+    @pytest.mark.asyncio
+    async def test_fetch_voice_agents_signs_empty_body(
+        self, api_client: CasaApiClient, mock_session: MagicMock,
+    ):
+        response = MagicMock(status=200)
+        response.raise_for_status = MagicMock()
+        response.json = AsyncMock(return_value={
+            "schema_version": 1,
+            "agents": [{"role": "butler", "name": "Tina"}],
+        })
+        mock_session.get = AsyncMock(return_value=response)
+
+        catalog = await api_client.fetch_voice_agents()
+
+        url, = mock_session.get.await_args.args
+        headers = mock_session.get.await_args.kwargs["headers"]
+        assert url.endswith("/api/voice/agents")
+        assert headers["X-Webhook-Signature"] == api_client._sign(b"")
+        assert catalog.agents[0].role == "butler"
+
+    @pytest.mark.asyncio
+    async def test_fetch_voice_agents_maps_401_to_authentication_error(
+        self, api_client: CasaApiClient, mock_session: MagicMock,
+    ):
+        response = MagicMock(status=401)
+        response.raise_for_status = MagicMock()
+        mock_session.get = AsyncMock(return_value=response)
+
+        with pytest.raises(AuthenticationError):
+            await api_client.fetch_voice_agents()
+
+        response.raise_for_status.assert_not_called()
+        response.release.assert_called_once_with()
+
+    @pytest.mark.asyncio
+    async def test_fetch_voice_agents_raises_for_non_success_status(
+        self, api_client: CasaApiClient, mock_session: MagicMock,
+    ):
+        error = aiohttp.ClientResponseError(None, (), status=503)
+        response = MagicMock(status=503)
+        response.raise_for_status = MagicMock(side_effect=error)
+        mock_session.get = AsyncMock(return_value=response)
+
+        with pytest.raises(aiohttp.ClientResponseError) as raised:
+            await api_client.fetch_voice_agents()
+
+        assert raised.value is error
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "decode_error",
+        [
+            json.JSONDecodeError("bad", "{", 0),
+            UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid encoding"),
+            aiohttp.ContentTypeError(None, (), message="unexpected content type"),
+        ],
+        ids=["json", "encoding", "content_type"],
+    )
+    async def test_fetch_voice_agents_maps_decode_errors_to_catalog_error(
+        self,
+        api_client: CasaApiClient,
+        mock_session: MagicMock,
+        decode_error,
+    ):
+        response = MagicMock(status=200)
+        response.raise_for_status = MagicMock()
+        response.json = AsyncMock(side_effect=decode_error)
+        mock_session.get = AsyncMock(return_value=response)
+
+        with pytest.raises(CatalogValidationError, match="invalid_json"):
+            await api_client.fetch_voice_agents()
+
+    @pytest.mark.asyncio
+    async def test_fetch_voice_agents_rejects_invalid_catalog_schema(
+        self, api_client: CasaApiClient, mock_session: MagicMock,
+    ):
+        response = MagicMock(status=200)
+        response.raise_for_status = MagicMock()
+        response.json = AsyncMock(return_value={
+            "schema_version": 2,
+            "agents": [],
+        })
+        mock_session.get = AsyncMock(return_value=response)
+
+        with pytest.raises(CatalogValidationError, match="unsupported_schema"):
+            await api_client.fetch_voice_agents()
+
+    @pytest.mark.asyncio
+    async def test_fetch_voice_agents_has_bounded_timeout(
+        self,
+        api_client: CasaApiClient,
+        mock_session: MagicMock,
+        monkeypatch,
+    ):
+        import custom_components.casa.api as api_mod
+
+        async def never_returns(*_args, **_kwargs):
+            await asyncio.Event().wait()
+
+        monkeypatch.setattr(api_mod, "TIMEOUT_HEALTH", 0.01)
+        mock_session.get = AsyncMock(side_effect=never_returns)
+
+        with pytest.raises(asyncio.TimeoutError):
+            await api_client.fetch_voice_agents()
+
+    @pytest.mark.asyncio
+    async def test_fetch_voice_agents_does_not_log_response_payload(
+        self,
+        api_client: CasaApiClient,
+        mock_session: MagicMock,
+        caplog,
+    ):
+        canary = "PRIVATE_CATALOG_PAYLOAD_CANARY"
+        response = MagicMock(status=200)
+        response.raise_for_status = MagicMock()
+        response.json = AsyncMock(return_value={
+            "schema_version": 1,
+            "agents": [
+                {"role": "butler", "name": "Tina", "prompt": canary},
+            ],
+        })
+        mock_session.get = AsyncMock(return_value=response)
+
+        with caplog.at_level(logging.DEBUG, logger="custom_components.casa.api"):
+            with pytest.raises(CatalogValidationError):
+                await api_client.fetch_voice_agents()
+
+        assert canary not in caplog.text
 
 
 class TestStreamUtteranceSSE:

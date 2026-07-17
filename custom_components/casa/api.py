@@ -13,6 +13,11 @@ from typing import Any
 
 import aiohttp
 
+from .catalog import (
+    CatalogValidationError,
+    VoiceAgentCatalog,
+    parse_voice_agent_catalog,
+)
 from .const import (
     HEALTH_PATH,
     SSE_PATH,
@@ -21,6 +26,7 @@ from .const import (
     TIMEOUT_TOTAL,
     VOICE_ROUTE_CAPABILITIES,
     VOICE_ROUTE_PROTOCOL,
+    VOICE_AGENTS_PATH,
     WS_PATH,
     WS_RECONNECT_MAX,
     WS_RECONNECT_MIN,
@@ -119,6 +125,28 @@ class CasaApiClient:
         async with asyncio.timeout(TIMEOUT_HEALTH):
             resp = await self._session.get(f"{self._base_url}{HEALTH_PATH}")
             return resp.status == 200
+
+    async def fetch_voice_agents(self) -> VoiceAgentCatalog:
+        """Fetch and validate Casa's authenticated voice-agent catalog."""
+        headers = {"X-Webhook-Signature": self._sign(b"")}
+        async with asyncio.timeout(TIMEOUT_HEALTH):
+            response = await self._session.get(
+                f"{self._base_url}{VOICE_AGENTS_PATH}",
+                headers=headers,
+            )
+            if response.status == 401:
+                response.release()
+                raise AuthenticationError("Invalid webhook secret")
+            response.raise_for_status()
+            try:
+                payload = await response.json()
+            except (
+                aiohttp.ContentTypeError,
+                json.JSONDecodeError,
+                UnicodeDecodeError,
+            ) as err:
+                raise CatalogValidationError("invalid_json") from err
+            return parse_voice_agent_catalog(payload)
 
     async def stream_utterance(
         self,

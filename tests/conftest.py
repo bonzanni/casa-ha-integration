@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import sys
 import types
+import uuid
+from dataclasses import dataclass, field
 from unittest.mock import MagicMock
 
 import pytest
@@ -15,6 +17,8 @@ HA_STUB_EXPORTS = frozenset({
     "homeassistant.config_entries:ConfigFlow",
     "homeassistant.config_entries:OptionsFlow",
     "homeassistant.config_entries:ConfigEntry",
+    "homeassistant.config_entries:ConfigSubentry",
+    "homeassistant.config_entries:ConfigSubentryData",
     "homeassistant.config_entries:ConfigFlowResult",
     "homeassistant.const:Platform", "homeassistant.const:MATCH_ALL",
     "homeassistant.const:EVENT_STATE_CHANGED",
@@ -73,6 +77,14 @@ def _ensure_ha_stubs() -> None:
     class _ConfigFlowResult(dict):
         pass
 
+    @dataclass(frozen=True)
+    class _ConfigSubentry:
+        data: dict
+        subentry_type: str
+        title: str
+        unique_id: str | None = None
+        subentry_id: str = field(default_factory=lambda: str(uuid.uuid4()))
+
     class _ConfigFlow:
         def __init_subclass__(cls, domain=None, **kw):
             super().__init_subclass__(**kw)
@@ -86,8 +98,16 @@ def _ensure_ha_stubs() -> None:
         def async_show_form(self, *, step_id, data_schema=None, errors=None, **kw):
             return _ConfigFlowResult(type="form", step_id=step_id, data_schema=data_schema, errors=errors or {})
 
-        def async_create_entry(self, *, title, data, **kw):
-            return _ConfigFlowResult(type="create_entry", title=title, data=data)
+        def async_create_entry(
+            self, *, title, data, subentries=(), options=None, **kw,
+        ):
+            return _ConfigFlowResult(
+                type="create_entry",
+                title=title,
+                data=data,
+                subentries=list(subentries),
+                options=options or {},
+            )
 
         def async_abort(self, *, reason):
             return _ConfigFlowResult(type="abort", reason=reason)
@@ -122,6 +142,8 @@ def _ensure_ha_stubs() -> None:
     ha_ce.ConfigFlow = _ConfigFlow
     ha_ce.OptionsFlow = _OptionsFlow
     ha_ce.ConfigEntry = MagicMock
+    ha_ce.ConfigSubentry = _ConfigSubentry
+    ha_ce.ConfigSubentryData = dict
     ha_ce.ConfigFlowResult = _ConfigFlowResult
 
     ha_const = _make_stub_module("homeassistant.const")
