@@ -6,6 +6,8 @@ import sys
 import types
 import uuid
 from dataclasses import dataclass, field
+from types import SimpleNamespace
+from typing import Any
 from unittest.mock import MagicMock
 
 import pytest
@@ -15,6 +17,7 @@ HA_STUB_EXPORTS = frozenset({
     "homeassistant.core:callback", "homeassistant.core:HomeAssistant",
     "homeassistant.core:Event", "homeassistant.core:EventStateChangedData",
     "homeassistant.config_entries:ConfigFlow",
+    "homeassistant.config_entries:ConfigSubentryFlow",
     "homeassistant.config_entries:OptionsFlow",
     "homeassistant.config_entries:ConfigEntry",
     "homeassistant.config_entries:ConfigSubentry",
@@ -94,6 +97,8 @@ def _ensure_ha_stubs() -> None:
         def __init__(self):
             self.hass = None
             self.context: dict = {}
+            self.abort_entries_match_calls: list[dict] = []
+            self.unique_id = None
 
         def async_show_form(self, *, step_id, data_schema=None, errors=None, **kw):
             return _ConfigFlowResult(type="form", step_id=step_id, data_schema=data_schema, errors=errors or {})
@@ -113,7 +118,10 @@ def _ensure_ha_stubs() -> None:
             return _ConfigFlowResult(type="abort", reason=reason)
 
         async def async_set_unique_id(self, unique_id):
-            pass
+            self.unique_id = unique_id
+
+        def _async_abort_entries_match(self, match_dict):
+            self.abort_entries_match_calls.append(dict(match_dict))
 
         def _abort_if_unique_id_configured(self):
             pass
@@ -121,8 +129,62 @@ def _ensure_ha_stubs() -> None:
         def _get_reauth_entry(self):
             return MagicMock()
 
-        def async_update_reload_and_abort(self, entry, *, data_updates=None, **kw):
+        def async_update_and_abort(self, entry, *, data_updates=None, **kw):
+            if data_updates:
+                entry.data = {**entry.data, **data_updates}
             return _ConfigFlowResult(type="abort", reason="reauth_successful")
+
+        def async_update_reload_and_abort(self, entry, *, data_updates=None, **kw):
+            if data_updates:
+                entry.data = {**entry.data, **data_updates}
+            return _ConfigFlowResult(type="abort", reason="reauth_successful")
+
+    class _ConfigSubentryFlow:
+        def __init__(self):
+            self.hass = None
+            self.context: dict = {}
+            self._entry = None
+            self._reconfigure_subentry = None
+
+        def _get_entry(self):
+            return self._entry
+
+        def _get_reconfigure_subentry(self):
+            return self._reconfigure_subentry
+
+        def async_show_form(self, *, step_id, data_schema=None, errors=None, **kw):
+            return _ConfigFlowResult(
+                type="form",
+                step_id=step_id,
+                data_schema=data_schema,
+                errors=errors or {},
+            )
+
+        def async_abort(self, *, reason):
+            return _ConfigFlowResult(type="abort", reason=reason)
+
+        def async_update_and_abort(
+            self,
+            entry,
+            subentry,
+            *,
+            data=None,
+            title=None,
+            unique_id=None,
+        ):
+            changes = {}
+            if data is not None:
+                changes["data"] = data
+            if title is not None:
+                changes["title"] = title
+            if unique_id is not None:
+                changes["unique_id"] = unique_id
+            self.hass.config_entries.async_update_subentry(
+                entry,
+                subentry,
+                **changes,
+            )
+            return _ConfigFlowResult(type="abort", reason="reconfigure_successful")
 
     class _OptionsFlow:
         def __init__(self):
@@ -140,6 +202,7 @@ def _ensure_ha_stubs() -> None:
             return schema
 
     ha_ce.ConfigFlow = _ConfigFlow
+    ha_ce.ConfigSubentryFlow = _ConfigSubentryFlow
     ha_ce.OptionsFlow = _OptionsFlow
     ha_ce.ConfigEntry = MagicMock
     ha_ce.ConfigSubentry = _ConfigSubentry
@@ -268,6 +331,51 @@ def _ensure_ha_stubs() -> None:
 
 
 _ensure_ha_stubs()
+
+
+class ConfigEntriesRecorder:
+    """Record public subentry mutations while matching Home Assistant behavior."""
+
+    def __init__(self) -> None:
+        self.added_subentries: list[tuple[Any, Any]] = []
+        self.updated_subentries: list[tuple[Any, Any, dict[str, Any]]] = []
+
+    def async_add_subentry(self, entry: Any, subentry: Any) -> None:
+        self.added_subentries.append((entry, subentry))
+        entry.subentries = {**entry.subentries, subentry.subentry_id: subentry}
+
+    def async_update_subentry(
+        self,
+        entry: Any,
+        subentry: Any,
+        **changes: Any,
+    ) -> None:
+        self.updated_subentries.append((entry, subentry, changes))
+        for key, value in changes.items():
+            object.__setattr__(subentry, key, value)
+
+
+@pytest.fixture
+def hass() -> SimpleNamespace:
+    """Minimal Home Assistant with recording public config-entry mutators."""
+    return SimpleNamespace(config_entries=ConfigEntriesRecorder())
+
+
+@pytest.fixture
+def async_add_entities():
+    """Record entity additions, including the public subentry association."""
+    calls: list[tuple[list[Any], bool, str | None]] = []
+
+    def add_entities(
+        entities: list[Any],
+        update_before_add: bool = False,
+        *,
+        config_subentry_id: str | None = None,
+    ) -> None:
+        calls.append((entities, update_before_add, config_subentry_id))
+
+    add_entities.calls = calls
+    return add_entities
 
 
 @pytest.fixture
