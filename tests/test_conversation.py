@@ -24,6 +24,7 @@ from custom_components.casa.conversation import (
     CasaConversationEntity,
     async_setup_entry,
 )
+from custom_components.casa.catalog import role_label
 from custom_components.casa.const import (
     CONF_AGENT_NAME,
     CONF_IDLE_STABILITY_MS,
@@ -60,7 +61,9 @@ def _subentry(
             CONF_IDLE_STABILITY_MS: 750,
         }),
         subentry_type=subentry_type,
-        title=name,
+        # Production keeps the role-derived Home Assistant identity separate
+        # from Casa's mutable persona alias in CONF_AGENT_NAME.
+        title=role_label(role),
         unique_id=role,
         subentry_id=subentry_id,
     )
@@ -78,7 +81,7 @@ def _runtime(
         parent_entry_id="entry-1",
         subentry_id=subentry.subentry_id,
         role=subentry.unique_id,
-        name=subentry.title,
+        name=subentry.data[CONF_AGENT_NAME],
         session_mode=subentry.data[CONF_SESSION_MODE],
         transport=subentry.data[CONF_TRANSPORT],
         idle_stability_ms=subentry.data[CONF_IDLE_STABILITY_MS],
@@ -145,7 +148,7 @@ class _ChatLogCapture:
 
 class TestPerSubentryEntities:
     @pytest.mark.asyncio
-    async def test_setup_adds_each_voice_child_with_exact_subentry_identity(
+    async def test_setup_keeps_persona_metadata_under_stable_role_voice_identity(
         self,
         async_add_entities,
     ):
@@ -180,12 +183,18 @@ class TestPerSubentryEntities:
         ]
         tina = async_add_entities.calls[0][0][0]
         gary = async_add_entities.calls[1][0][0]
-        assert tina._attr_name == "Tina"
-        assert gary._attr_name == "Gary"
+        assert tina._attr_name == "Voice"
+        assert gary._attr_name == "Voice"
+        assert tina._attr_has_entity_name is True
+        assert gary._attr_has_entity_name is True
         assert tina.unique_id == "entry-1:butler"
         assert gary.unique_id == "entry-1:concierge"
         assert tina.device_info["identifiers"] == {(DOMAIN, "entry-1:butler")}
         assert gary.device_info["identifiers"] == {(DOMAIN, "entry-1:concierge")}
+        assert tina.device_info["name"] == "Casa Butler"
+        assert gary.device_info["name"] == "Casa Concierge"
+        # Home Assistant uses the device plus entity name for the picker;
+        # persona aliases remain model metadata rather than service identity.
         assert tina.device_info["model"] == "Tina (butler)"
         assert gary.device_info["model"] == "Gary (concierge)"
         assert tina._runtime is butler_runtime
@@ -240,7 +249,7 @@ class TestPerSubentryEntities:
         assert gary_call["scope_id"] == "c-1"
         assert gary_call["transport"] == TRANSPORT_SSE
 
-    def test_catalog_rename_changes_labels_but_not_stable_identity(self):
+    def test_catalog_rename_changes_model_but_not_stable_voice_identity(self):
         old_subentry = _subentry(name="Old Tina")
         old_runtime = _runtime(old_subentry)
         old_entity = CasaConversationEntity(
@@ -257,8 +266,8 @@ class TestPerSubentryEntities:
         )
 
         assert old_entity.unique_id == renamed_entity.unique_id == "entry-1:butler"
-        assert old_entity._attr_name == "Old Tina"
-        assert renamed_entity._attr_name == "Tina"
+        assert old_entity._attr_name == "Voice"
+        assert renamed_entity._attr_name == "Voice"
         assert old_entity.device_info["model"] == "Old Tina (butler)"
         assert renamed_entity.device_info["model"] == "Tina (butler)"
 

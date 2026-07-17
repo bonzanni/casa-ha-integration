@@ -67,7 +67,7 @@
           "data_description": {
             "session_mode": "How memory scope is derived: per device, per user, or per conversation.",
             "transport": "Prefer WebSocket for voice session registration and background results, or use SSE as a stateless fallback.",
-            "idle_stability_ms": "How long Casa waits after the voice assistant becomes idle before speaking a queued specialist result. This prevents Gary from interrupting an active conversation or follow-up. If the device is already idle, the result is spoken immediately. Default: 750 ms."
+            "idle_stability_ms": "After a queued result is ready, Casa waits only if the Assist satellite is still busy. If it is already idle, Casa speaks immediately. Once the satellite becomes idle, it waits this long to let brief follow-ups settle. Default: 750 ms."
           }
         }
       },

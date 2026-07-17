@@ -50,7 +50,7 @@ def test_ack_loss_replay_boundary_is_explicit(filename):
     assert "can never replay after a manager or integration process restart" not in text
 
 
-def test_release_metadata_is_v050_with_existing_ha_minimum():
+def test_release_metadata_is_v051_with_existing_ha_minimum():
     manifest = json.loads(
         (_ROOT / "custom_components/casa/manifest.json").read_text(
             encoding="utf-8",
@@ -58,7 +58,7 @@ def test_release_metadata_is_v050_with_existing_ha_minimum():
     )
     hacs = json.loads((_ROOT / "hacs.json").read_text(encoding="utf-8"))
 
-    assert manifest["version"] == "0.5.0"
+    assert manifest["version"] == "0.5.1"
     assert hacs["homeassistant"] == "2026.4.0"
 
 
@@ -66,10 +66,13 @@ def test_readme_documents_catalog_parent_and_agent_children():
     text = _normalized("README.md")
 
     assert "one Casa parent" in text
-    assert "separate conversation entities for Tina, Gary, and future" in text
+    assert "separate role-stable conversation entities for Butler, Concierge" in text
     assert "There is no agent role field" in text
-    assert "matching discovered agent" in text
-    assert "Casa Butler" not in text
+    assert "matching discovered role" in text
+    assert "Casa Butler → Voice" in text
+    assert "Casa Concierge → Voice" in text
+    assert "stable role identity" in text
+    assert "mutable catalog persona aliases" in text
 
 
 def test_readme_documents_parent_and_child_configuration_boundaries():
@@ -107,10 +110,11 @@ def test_readme_e2e_matrix_covers_dynamic_agent_release_boundaries():
     assert "Real-system E2E" in text
     assert "Controlled fault-injection acceptance" in text
     assert "authenticated catalog" in text
-    assert "two conversation entities" in text
+    assert "Casa Butler → Voice" in text
+    assert "Casa Concierge → Voice" in text
     assert "server utterance-to-first-text-block p95 below 1.5 seconds" in text
     assert "end-of-speech-to-first-audible-output p95 below 3.0 seconds" in text
-    assert "Gary background result" in text
+    assert "Concierge background result" in text
     assert "missing role remains unavailable" in text
     assert "isolated cleanup" in text
     assert "catalog fixture" in text

@@ -295,7 +295,7 @@ class CasaConfigFlow(ConfigFlow, domain=DOMAIN):
                     break
                 else:
                     return self.async_create_entry(
-                        title=self._discovery_name,
+                        title="Casa",
                         data=data,
                         subentries=initial_subentry_data(catalog),
                     )
