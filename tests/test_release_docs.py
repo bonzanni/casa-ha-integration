@@ -66,10 +66,11 @@ def test_readme_documents_catalog_parent_and_agent_children():
     text = _normalized("README.md")
 
     assert "one Casa parent" in text
-    assert "separate conversation entities for Tina, Gary, and future" in text
+    assert "separate role-stable conversation entities for Butler, Concierge" in text
     assert "There is no agent role field" in text
-    assert "matching discovered agent" in text
-    assert "Casa Butler" not in text
+    assert "matching discovered role" in text
+    assert "Casa Butler → Voice" in text
+    assert "Casa Concierge → Voice" in text
 
 
 def test_readme_documents_parent_and_child_configuration_boundaries():
@@ -107,10 +108,11 @@ def test_readme_e2e_matrix_covers_dynamic_agent_release_boundaries():
     assert "Real-system E2E" in text
     assert "Controlled fault-injection acceptance" in text
     assert "authenticated catalog" in text
-    assert "two conversation entities" in text
+    assert "Casa Butler → Voice" in text
+    assert "Casa Concierge → Voice" in text
     assert "server utterance-to-first-text-block p95 below 1.5 seconds" in text
     assert "end-of-speech-to-first-audible-output p95 below 3.0 seconds" in text
-    assert "Gary background result" in text
+    assert "Concierge background result" in text
     assert "missing role remains unavailable" in text
     assert "isolated cleanup" in text
     assert "catalog fixture" in text

@@ -2,9 +2,9 @@
 
 Companion custom integration that connects Home Assistant to the
 [Casa add-on](https://github.com/bonzanni/casa-ha-app). Integration v0.5.0
-creates one Casa parent from the server's authenticated voice-agent catalog,
-then exposes separate conversation entities for Tina, Gary, and future
-catalog-discovered agents. Each entity has its own routing, connection,
+creates one **Casa** parent from the server's authenticated voice-agent catalog,
+then exposes separate role-stable conversation entities for Butler, Concierge,
+and future catalog-discovered agents. Each entity has its own routing, connection,
 availability, session settings, and background-delivery lifecycle.
 
 The integration streams TTS deltas, registers voice sessions from
@@ -58,9 +58,9 @@ connection on a trusted LAN, private network, or encrypted tunnel.
    → Add integration → Casa** and enter the exact host, port (default `18065`),
    and Casa webhook secret. Manual setup authenticates and validates the same
    complete catalog.
-7. In each Assist pipeline, select the matching discovered agent: Tina for
-   direct butler turns, Gary for concierge/specialist work, or the relevant
-   future catalog agent.
+7. In each Assist pipeline, select the matching discovered role: **Casa Butler
+   → Voice** for direct home-control turns, **Casa Concierge → Voice** for
+   concierge/specialist work, or the relevant future catalog role.
 
 There is no agent role field. Roles and display names come from Casa and remain
 fixed for each discovered child, so a pipeline cannot silently reroute to a
@@ -74,7 +74,17 @@ same installation, so alias-based duplicates remain possible.
 Casa publishes a strict, versioned Supervisor discovery record only while
 webhook authentication is enabled. On a later discovery for the same Supervisor
 UUID, Casa updates the stored endpoint and webhook secret and reloads the
-existing parent; its Tina, Gary, and future voice-agent children are retained.
+existing parent; its Butler, Concierge, and future voice-agent children are
+retained.
+
+### Stable Home Assistant names
+
+Home Assistant uses stable role identity rather than configurable Casa persona
+aliases. The integration parent is **Casa**; each discovered role has a device
+named **Casa &lt;Role&gt;** and one conversation entity named **Voice**. For example,
+Assist shows **Casa Butler → Voice** and **Casa Concierge → Voice**. Casa may
+configure those personas as Tina, Gary, or other names, but those names appear
+only as descriptive device metadata and never become pipeline-service identity.
 
 ## Options and agent settings
 
@@ -92,14 +102,14 @@ Use the **Reconfigure** action for the matching voice-agent child. Each child
 owns these mutable fields:
 
 - **Session mode** — memory scope derived per `device`, `user`, or
-  `conversation`. Tina defaults to device scope, Gary defaults to conversation
-  scope, and future roles default to device scope.
+  `conversation`. Butler defaults to device scope, Concierge defaults to
+  conversation scope, and future roles default to device scope.
 - **Transport** — `ws` (default, with session registration and negotiated
   background delivery) or `sse` (stateless synchronous fallback).
 - **Assist idle stability** — how long the satellite must remain idle before a
   queued result plays, from 0–5000 ms (default 750 ms).
 
-Role and catalog name are not editable. Home Assistant cannot make a config
+Role identity and persona metadata are not editable. Home Assistant cannot make a config
 subentry non-removable: if a user deletes a still-advertised voice-agent child,
 it is recreated on the next reload with the same parent-plus-role entity and
 route identity. If Casa stops advertising a role, its retained entity remains
@@ -146,18 +156,18 @@ catalog endpoint, with the Casa server upgraded first:
 
 1. Confirm the authenticated catalog accepts the configured webhook secret and
    rejects a bad secret.
-2. Add one Casa parent and verify it creates two conversation entities, Tina
-   and Gary, with separate stable entity IDs. Confirm no role selector appears
+2. Add one Casa parent and verify it creates **Casa Butler → Voice** and
+   **Casa Concierge → Voice**, with separate stable entity IDs. Confirm no role selector appears
    on the parent or agent forms.
-3. Select Tina in a pipeline. After one warm-up turn, measure at least 20 direct
+3. Select Casa Butler → Voice in a pipeline. After one warm-up turn, measure at least 20 direct
    turns with monotonic timestamps and require server
    utterance-to-first-text-block p95 below 1.5 seconds and Home Assistant
    end-of-speech-to-first-audible-output p95 below 3.0 seconds. Confirm every
-   request carries `butler` and the configured Tina session scope.
-4. Select Gary in another pipeline. Complete a Gary background result while
+   request carries `butler` and the configured Butler session scope.
+4. Select Casa Concierge → Voice in another pipeline. Complete a Concierge background result while
    the satellite is busy; verify it is announced only after stable idle and
-   uses Gary's route, not Tina's.
-5. Barge in during Tina TTS. Verify Casa receives a `cancel` frame for that
+   uses Concierge's route, not Butler's.
+5. Barge in during Butler TTS. Verify Casa receives a `cancel` frame for that
    utterance, Home Assistant recovers, and the next turn succeeds.
 6. Replace the Casa webhook secret. Confirm terminal authentication starts one
    parent reauthentication flow, and entering the new secret restores every
@@ -188,7 +198,7 @@ required observable are deterministic:
    task and socket introspection to verify every child socket, delivery worker,
    registration task, and the one shared listener close without leaking or
    rerouting work between children.
-6. Have the protocol proxy drop Gary's WebSocket after playback but before the
+6. Have the protocol proxy drop Concierge's WebSocket after playback but before the
    delivered acknowledgement. An ordinary reconnect must claim and acknowledge
    the reoffer without replay; after an integration restart the summary may
    replay once but must never be silently lost.

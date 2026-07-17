@@ -180,12 +180,14 @@ class TestPerSubentryEntities:
         ]
         tina = async_add_entities.calls[0][0][0]
         gary = async_add_entities.calls[1][0][0]
-        assert tina._attr_name == "Tina"
-        assert gary._attr_name == "Gary"
+        assert tina._attr_name == "Voice"
+        assert gary._attr_name == "Voice"
         assert tina.unique_id == "entry-1:butler"
         assert gary.unique_id == "entry-1:concierge"
         assert tina.device_info["identifiers"] == {(DOMAIN, "entry-1:butler")}
         assert gary.device_info["identifiers"] == {(DOMAIN, "entry-1:concierge")}
+        assert tina.device_info["name"] == "Casa Butler"
+        assert gary.device_info["name"] == "Casa Concierge"
         assert tina.device_info["model"] == "Tina (butler)"
         assert gary.device_info["model"] == "Gary (concierge)"
         assert tina._runtime is butler_runtime
@@ -240,7 +242,7 @@ class TestPerSubentryEntities:
         assert gary_call["scope_id"] == "c-1"
         assert gary_call["transport"] == TRANSPORT_SSE
 
-    def test_catalog_rename_changes_labels_but_not_stable_identity(self):
+    def test_catalog_rename_changes_model_but_not_stable_voice_identity(self):
         old_subentry = _subentry(name="Old Tina")
         old_runtime = _runtime(old_subentry)
         old_entity = CasaConversationEntity(
@@ -257,8 +259,8 @@ class TestPerSubentryEntities:
         )
 
         assert old_entity.unique_id == renamed_entity.unique_id == "entry-1:butler"
-        assert old_entity._attr_name == "Old Tina"
-        assert renamed_entity._attr_name == "Tina"
+        assert old_entity._attr_name == "Voice"
+        assert renamed_entity._attr_name == "Voice"
         assert old_entity.device_info["model"] == "Old Tina (butler)"
         assert renamed_entity.device_info["model"] == "Tina (butler)"
 

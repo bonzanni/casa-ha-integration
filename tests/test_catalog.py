@@ -16,6 +16,7 @@ from custom_components.casa.catalog import (
     initial_subentry_data,
     parse_voice_agent_catalog,
     reconcile_catalog,
+    role_label,
 )
 from custom_components.casa.const import (
     CONF_AGENT_NAME,
@@ -156,8 +157,8 @@ def test_initial_subentries_have_role_defaults():
     )
 
     assert [(child["unique_id"], child["title"]) for child in children] == [
-        ("butler", "Tina"),
-        ("concierge", "Gary"),
+        ("butler", "Butler"),
+        ("concierge", "Concierge"),
     ]
     assert children[0]["subentry_type"] == SUBENTRY_TYPE_AGENT
     assert children[0]["data"][CONF_ROLE] == "butler"
@@ -176,6 +177,11 @@ def test_initial_subentries_have_role_defaults():
     )
 
 
+def test_role_label_is_stable_and_human_readable():
+    assert role_label("butler") == "Butler"
+    assert role_label("mtg_judge") == "Mtg Judge"
+
+
 def test_reconcile_adds_new_role_once_and_is_idempotent(hass):
     entry = SimpleNamespace(subentries={})
     catalog = _catalog("specialist", "Grace")
@@ -186,7 +192,7 @@ def test_reconcile_adds_new_role_once_and_is_idempotent(hass):
     assert len(hass.config_entries.added_subentries) == 1
     child = next(iter(entry.subentries.values()))
     assert child.unique_id == "specialist"
-    assert child.title == "Grace"
+    assert child.title == "Specialist"
     assert child.subentry_type == SUBENTRY_TYPE_AGENT
     assert child.data[CONF_SESSION_MODE] == SESSION_MODE_DEVICE
     assert hass.config_entries.updated_subentries == []
@@ -216,7 +222,7 @@ def test_reconcile_rename_preserves_identity_and_user_settings(hass):
     assert len(hass.config_entries.updated_subentries) == 1
     assert child.subentry_id == "stable-subentry-id"
     assert child.unique_id == "butler"
-    assert child.title == "Tina"
+    assert child.title == "Butler"
     assert child.data == {
         CONF_ROLE: "butler",
         CONF_AGENT_NAME: "Tina",

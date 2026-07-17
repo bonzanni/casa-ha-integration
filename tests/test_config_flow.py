@@ -69,8 +69,8 @@ def _schema_keys(result: dict) -> set[str]:
 def _assert_catalog_children(result: dict) -> None:
     children = result["subentries"]
     assert [(child["unique_id"], child["title"]) for child in children] == [
-        ("butler", "Tina"),
-        ("concierge", "Gary"),
+        ("butler", "Butler"),
+        ("concierge", "Concierge"),
     ]
     assert children[0]["data"][CONF_SESSION_MODE] == SESSION_MODE_DEVICE
     assert (
@@ -417,7 +417,7 @@ class TestHassio:
             result = await flow.async_step_hassio_confirm({"confirm": True})
 
         assert result["type"] == "create_entry"
-        assert result["title"] == "Casa Add-on"
+        assert result["title"] == "Casa"
         _assert_catalog_children(result)
 
     @pytest.mark.asyncio

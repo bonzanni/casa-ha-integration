@@ -54,6 +54,11 @@ class CatalogValidationError(ValueError):
     """Raised when Casa's complete discovery response is unsafe to use."""
 
 
+def role_label(role: str) -> str:
+    """Return the stable human-readable label for a Casa role."""
+    return role.replace("_", " ").replace("-", " ").title()
+
+
 def parse_voice_agent_catalog(payload: Any) -> VoiceAgentCatalog:
     """Validate the complete schema-1 catalog and return immutable agents."""
     if not isinstance(payload, dict) or set(payload) != {"schema_version", "agents"}:
@@ -139,7 +144,7 @@ def initial_subentry_data(
         {
             "data": agent_data(agent),
             "subentry_type": SUBENTRY_TYPE_AGENT,
-            "title": agent.name,
+            "title": role_label(agent.role),
             "unique_id": agent.role,
         }
         for agent in _validated_agents(catalog)
@@ -168,7 +173,7 @@ def reconcile_catalog(
             subentry = ConfigSubentry(
                 data=MappingProxyType(agent_data(agent)),
                 subentry_type=SUBENTRY_TYPE_AGENT,
-                title=agent.name,
+                title=role_label(agent.role),
                 unique_id=agent.role,
             )
             hass.config_entries.async_add_subentry(entry, subentry)
@@ -176,7 +181,7 @@ def reconcile_catalog(
             continue
 
         if (
-            existing.title == agent.name
+            existing.title == role_label(agent.role)
             and existing.data.get(CONF_AGENT_NAME) == agent.name
         ):
             continue
@@ -189,5 +194,5 @@ def reconcile_catalog(
             entry,
             existing,
             data=MappingProxyType(updated_data),
-            title=agent.name,
+            title=role_label(agent.role),
         )

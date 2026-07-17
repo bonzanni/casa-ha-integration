@@ -19,6 +19,7 @@ from homeassistant.helpers import intent
 
 from . import CasaAgentRuntime
 from .api import AuthenticationError, BlockFrame, ErrorFrame
+from .catalog import role_label
 from .const import (
     DOMAIN,
     FALLBACK,
@@ -60,7 +61,7 @@ class CasaConversationEntity(conversation.ConversationEntity):
         self._session_mode = runtime.session_mode
         self._transport = runtime.transport
         self._availability_unsubscribe: Callable[[], None] | None = None
-        self._attr_name = subentry.title
+        self._attr_name = "Voice"
         self._attr_unique_id = runtime.entity_unique_id
 
     @property
@@ -76,7 +77,7 @@ class CasaConversationEntity(conversation.ConversationEntity):
     def device_info(self) -> dr.DeviceInfo:
         return dr.DeviceInfo(
             identifiers={(DOMAIN, self._runtime.entity_unique_id)},
-            name="Casa",
+            name=f"Casa {role_label(self._agent_role)}",
             manufacturer="Casa",
             model=f"{self._runtime.name} ({self._agent_role})",
             sw_version=INTEGRATION_VERSION,
