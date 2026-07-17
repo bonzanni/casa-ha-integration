@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import time
 from collections import OrderedDict, defaultdict
 from collections.abc import Mapping
@@ -167,7 +168,7 @@ class BackgroundDeliveryManager:
         idle_stability_ms: int = 750,
         clock: Any | None = None,
     ) -> None:
-        if not 0 <= idle_stability_ms <= 5000:
+        if type(idle_stability_ms) is not int or not 0 <= idle_stability_ms <= 5000:
             raise ValueError("idle stability must be between 0 and 5000 ms")
         self.hass = hass
         self.client = client
@@ -253,9 +254,20 @@ class BackgroundDeliveryManager:
             or not isinstance(ready_at, (int, float))
             or isinstance(expires_at, bool)
             or not isinstance(expires_at, (int, float))
-            or float(expires_at) <= self._clock.now
             or type(sequence) is not int
             or sequence < 1
+        ):
+            return None
+        try:
+            ready_at_float = float(ready_at)
+            expires_at_float = float(expires_at)
+        except (OverflowError, ValueError):
+            return None
+        if (
+            not math.isfinite(ready_at_float)
+            or not math.isfinite(expires_at_float)
+            or ready_at_float >= expires_at_float
+            or expires_at_float <= self._clock.now
         ):
             return None
         return _Delivery(
@@ -264,7 +276,7 @@ class BackgroundDeliveryManager:
             device_id=device_id,
             entity_id="",
             spoken_text=spoken_text,
-            expires_at=float(expires_at),
+            expires_at=expires_at_float,
             sequence=sequence,
             revoked=asyncio.Event(),
             lease_lost=asyncio.Event(),
@@ -293,6 +305,16 @@ class BackgroundDeliveryManager:
             finally:
                 self._attempts.pop((delivery.job_id, delivery.attempt_id), None)
                 queue.task_done()
+            if queue.empty():
+                current = asyncio.current_task()
+                if (
+                    self._queues.get(device_id) is queue
+                    and self._workers.get(device_id) is current
+                ):
+                    self._queues.pop(device_id, None)
+                    self._workers.pop(device_id, None)
+                    self._mutexes.pop(device_id, None)
+                    return
 
     async def _deliver(self, delivery: _Delivery) -> None:
         if delivery.revoked.is_set():
@@ -338,6 +360,8 @@ class BackgroundDeliveryManager:
                     return
                 delivery.phase = "playing"
                 await self._send(self._frame(delivery, "job_playback_started"))
+                if not self._ready_for_playback(delivery):
+                    return
                 announce_started = self._clock.now
                 await self.hass.services.async_call(
                     "assist_satellite",
@@ -575,6 +599,21 @@ class BackgroundDeliveryManager:
         return len(self._workers)
 
     @property
+    def queue_count_for_test(self) -> int:
+        """Expose manager-owned device queue count for lifecycle assertions."""
+        return len(self._queues)
+
+    @property
+    def mutex_count_for_test(self) -> int:
+        """Expose manager-owned device mutex count for lifecycle assertions."""
+        return len(self._mutexes)
+
+    @property
+    def attempt_count_for_test(self) -> int:
+        """Expose manager-owned active attempt count for lifecycle assertions."""
+        return len(self._attempts)
+
+    @property
     def owned_task_count_for_test(self) -> int:
         """Expose detached manager task count for lifecycle assertions."""
         return len(self._owned_tasks)
@@ -600,7 +639,11 @@ class BackgroundDeliveryManager:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
         self._authorization.clear()
+        self._attempts.clear()
+        self._queues.clear()
         self._workers.clear()
+        self._mutexes.clear()
+        self._delivered.clear()
         self._owned_tasks.clear()
 
 

@@ -47,6 +47,18 @@ def _state_change_event(
     return ev
 
 
+def _registry_event(
+    entity_id: str,
+    *,
+    action: str = "update",
+    old_entity_id: str | None = None,
+):
+    data = {"action": action, "entity_id": entity_id}
+    if old_entity_id is not None:
+        data["old_entity_id"] = old_entity_id
+    return SimpleNamespace(data=data)
+
+
 def _listener(hass, client, transport=TRANSPORT_WS, directory=None):
     return SessionRegistrationListener(
         hass,
@@ -60,8 +72,10 @@ def _listener(hass, client, transport=TRANSPORT_WS, directory=None):
 class TestSessionRegistrationListener:
     def test_attach_tracks_assist_satellite_domain(self):
         from homeassistant.helpers import event as ha_event
+        from homeassistant.helpers import entity_registry as er
 
         ha_event.async_track_state_change_filtered.reset_mock()
+        er.EVENT_ENTITY_REGISTRY_UPDATED = "entity_registry_updated"
         hass = MagicMock()
         hass.states.async_all.return_value = []
         listener = _listener(hass, MagicMock())
@@ -73,10 +87,16 @@ class TestSessionRegistrationListener:
         assert track_states.entities == set()
         assert track_states.domains == {"assist_satellite"}
         assert args[2] == listener.handle
+        hass.bus.async_listen.assert_called_once_with(
+            er.EVENT_ENTITY_REGISTRY_UPDATED,
+            listener.handle_registry_update,
+        )
 
         tracker = ha_event.async_track_state_change_filtered.return_value
+        registry_unsubscribe = hass.bus.async_listen.return_value
         listener.detach()
         tracker.async_remove.assert_called_once()
+        registry_unsubscribe.assert_called_once_with()
 
     def test_attach_discovers_existing_idle_with_last_changed(self):
         hass = MagicMock()
@@ -95,6 +115,21 @@ class TestSessionRegistrationListener:
         assert directory.resolve("dev-kitchen") == "assist_satellite.kitchen"
         assert directory.state("dev-kitchen") == "idle"
         assert directory.idle_since("dev-kitchen") == 42.5
+
+    def test_detach_still_removes_registry_listener_if_state_detach_fails(self):
+        listener = _listener(MagicMock(), MagicMock())
+        tracker = MagicMock()
+        tracker.async_remove.side_effect = RuntimeError("state detach failed")
+        registry_unsubscribe = MagicMock()
+        listener._tracker = tracker
+        listener._registry_unsubscribe = registry_unsubscribe
+
+        with pytest.raises(RuntimeError, match="state detach failed"):
+            listener.detach()
+
+        registry_unsubscribe.assert_called_once_with()
+        assert listener._tracker is None
+        assert listener._registry_unsubscribe is None
 
     @pytest.mark.asyncio
     async def test_listening_registers_session_with_device_id(self):
@@ -218,3 +253,101 @@ class TestSessionRegistrationListener:
             directory.resolve("dev-old")
         assert directory.resolve("dev-new") == "assist_satellite.kitchen"
         assert directory.state("dev-new") == "responding"
+
+    def test_registry_only_device_rebind_refreshes_unchanged_state(self):
+        hass = MagicMock()
+        state = _state("assist_satellite.kitchen", "idle", changed_at=42.5)
+        hass.states.get.return_value = state
+        directory = SatelliteDirectory()
+        directory.set_entity_state(
+            "dev-old",
+            "assist_satellite.kitchen",
+            "idle",
+            changed_at=42.5,
+        )
+        from homeassistant.helpers import entity_registry as er
+
+        entry = MagicMock(device_id="dev-new")
+        er.async_get = MagicMock(return_value=MagicMock(async_get=lambda _id: entry))
+        listener = _listener(hass, MagicMock(), directory=directory)
+
+        listener.handle_registry_update(_registry_event("assist_satellite.kitchen"))
+
+        with pytest.raises(SatelliteNotFound):
+            directory.resolve("dev-old")
+        assert directory.resolve("dev-new") == "assist_satellite.kitchen"
+        assert directory.state("dev-new") == "idle"
+
+    @pytest.mark.parametrize("event_order", ["state_first", "registry_first"])
+    def test_state_and_registry_update_interleavings_keep_current_binding(
+        self, event_order,
+    ):
+        hass = MagicMock()
+        state = _state("assist_satellite.kitchen", "responding")
+        hass.states.get.return_value = state
+        directory = SatelliteDirectory()
+        from homeassistant.helpers import entity_registry as er
+
+        entry = MagicMock(device_id="dev-old")
+        er.async_get = MagicMock(return_value=MagicMock(async_get=lambda _id: entry))
+        listener = _listener(hass, MagicMock(), directory=directory)
+        listener.handle(_state_change_event("assist_satellite.kitchen", "responding"))
+        entry.device_id = "dev-new"
+
+        if event_order == "state_first":
+            listener.handle(_state_change_event(
+                "assist_satellite.kitchen", "responding",
+            ))
+            listener.handle_registry_update(
+                _registry_event("assist_satellite.kitchen"),
+            )
+        else:
+            listener.handle_registry_update(
+                _registry_event("assist_satellite.kitchen"),
+            )
+            listener.handle(_state_change_event(
+                "assist_satellite.kitchen", "responding",
+            ))
+
+        with pytest.raises(SatelliteNotFound):
+            directory.resolve("dev-old")
+        assert directory.resolve("dev-new") == "assist_satellite.kitchen"
+
+    def test_registry_rename_removes_old_and_discovers_new_assist_entity(self):
+        hass = MagicMock()
+        new_state = _state("assist_satellite.den", "idle", changed_at=88.0)
+        hass.states.get.return_value = new_state
+        directory = SatelliteDirectory()
+        directory.add("dev-old", "assist_satellite.kitchen")
+        from homeassistant.helpers import entity_registry as er
+
+        entry = MagicMock(device_id="dev-new")
+        er.async_get = MagicMock(return_value=MagicMock(async_get=lambda _id: entry))
+        listener = _listener(hass, MagicMock(), directory=directory)
+
+        listener.handle_registry_update(_registry_event(
+            "assist_satellite.den",
+            old_entity_id="assist_satellite.kitchen",
+        ))
+
+        with pytest.raises(SatelliteNotFound):
+            directory.resolve("dev-old")
+        assert directory.resolve("dev-new") == "assist_satellite.den"
+
+    def test_registry_remove_clears_binding_even_if_state_still_exists(self):
+        hass = MagicMock()
+        hass.states.get.return_value = _state("assist_satellite.kitchen", "idle")
+        directory = SatelliteDirectory()
+        directory.add("dev-k", "assist_satellite.kitchen")
+        from homeassistant.helpers import entity_registry as er
+
+        er.async_get = MagicMock(return_value=MagicMock(async_get=lambda _id: None))
+        listener = _listener(hass, MagicMock(), directory=directory)
+
+        listener.handle_registry_update(_registry_event(
+            "assist_satellite.kitchen",
+            action="remove",
+        ))
+
+        with pytest.raises(SatelliteNotFound):
+            directory.resolve("dev-k")

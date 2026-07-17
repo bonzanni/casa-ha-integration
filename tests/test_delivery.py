@@ -449,6 +449,36 @@ class TestFinalRechecksAndRevocation:
         assert "job_revoked" not in types
         manager.hass.services.async_call.assert_awaited_once()
 
+    @pytest.mark.parametrize("invalidation", ["state", "rebind"])
+    async def test_playback_started_send_revalidates_before_announce(
+        self, delivery_manager, invalidation,
+    ):
+        manager, clock = delivery_manager
+        manager.directory.set_state("dev-k", "idle", changed_at=clock.now - 10)
+
+        async def invalidate_during_playback_started(frame):
+            if frame["type"] != "job_playback_started":
+                return
+            if invalidation == "state":
+                manager.directory.set_state(
+                    "dev-k", "listening", changed_at=clock.now,
+                )
+            else:
+                manager.directory.remove("assist_satellite.kitchen")
+                manager.directory.add("dev-k", "assist_satellite.kitchen_2")
+                manager.directory.set_state(
+                    "dev-k", "idle", changed_at=clock.now - 10,
+                )
+
+        manager.client.on_send = invalidate_during_playback_started
+        await manager.handle_frame(job_ready("job-1"))
+        await manager.drain_for_test()
+
+        assert sent_types(manager.client)[-1] == "job_playback_started"
+        assert "job_nack" not in sent_types(manager.client)
+        assert "job_revoked" not in sent_types(manager.client)
+        manager.hass.services.async_call.assert_not_awaited()
+
     async def test_authorization_wait_is_bounded_to_ten_seconds(self, delivery_manager):
         manager, clock = delivery_manager
         manager.directory.set_state("dev-k", "idle", changed_at=clock.now - 10)
@@ -643,6 +673,46 @@ class TestPerDeviceWorkers:
         assert "job-0" not in manager.delivered_ids_for_test
         assert "job-256" in manager.delivered_ids_for_test
 
+    async def test_idle_worker_atomically_retires_all_per_device_structures(
+        self, delivery_manager,
+    ):
+        manager, clock = delivery_manager
+        manager.directory.set_state("dev-k", "idle", changed_at=clock.now - 10)
+
+        await manager.handle_frame(job_ready("job-1"))
+        await manager.drain_for_test()
+
+        assert manager.worker_count_for_test == 0
+        assert manager.queue_count_for_test == 0
+        assert manager.mutex_count_for_test == 0
+        assert manager.attempt_count_for_test == 0
+
+    async def test_offer_interleaved_with_worker_completion_is_not_lost(
+        self, delivery_manager,
+    ):
+        manager, clock = delivery_manager
+        manager.directory.set_state("dev-k", "idle", changed_at=clock.now - 10)
+        queued_followup = False
+
+        async def queue_followup(frame):
+            nonlocal queued_followup
+            if frame["type"] == "job_delivered" and not queued_followup:
+                queued_followup = True
+                await manager.handle_frame(job_ready("job-2", sequence=2))
+
+        manager.client.on_send = queue_followup
+        await manager.handle_frame(job_ready("job-1"))
+        await manager.drain_for_test()
+
+        delivered_jobs = {
+            frame["job_id"] for frame in manager.client.sent
+            if frame["type"] == "job_delivered"
+        }
+        assert delivered_jobs == {"job-1", "job-2"}
+        assert manager.worker_count_for_test == 0
+        assert manager.queue_count_for_test == 0
+        assert manager.mutex_count_for_test == 0
+
     async def test_close_cancels_and_awaits_manager_workers(self, delivery_manager):
         manager, clock = delivery_manager
         manager.directory.set_state("dev-k", "processing", changed_at=clock.now)
@@ -676,6 +746,28 @@ class TestPerDeviceWorkers:
         assert send_cancelled.is_set()
         assert manager.owned_task_count_for_test == 0
 
+    async def test_close_clears_all_payload_bearing_and_attempt_state(
+        self, delivery_manager,
+    ):
+        manager, clock = delivery_manager
+        manager.directory.set_state("dev-k", "processing", changed_at=clock.now)
+        await manager.handle_frame(job_ready(
+            "job-secret",
+            spoken_text="SECRET_CLOSE_PAYLOAD_CANARY",
+        ))
+        await clock.settle()
+        manager.remember_delivered_for_test("job-previous")
+
+        await manager.close()
+
+        assert "SECRET_CLOSE_PAYLOAD_CANARY" not in repr(vars(manager))
+        assert manager.worker_count_for_test == 0
+        assert manager.owned_task_count_for_test == 0
+        assert manager.queue_count_for_test == 0
+        assert manager.mutex_count_for_test == 0
+        assert manager.attempt_count_for_test == 0
+        assert manager.delivered_ids_for_test == frozenset()
+
 
 class TestProtocolAndPrivacy:
     @pytest.mark.parametrize(
@@ -685,6 +777,12 @@ class TestProtocolAndPrivacy:
             {"protocol": 1.0},
             {"route_id": "entry-other"},
             {"expires_at": 100.0},
+            {"ready_at": float("nan")},
+            {"ready_at": float("inf")},
+            {"expires_at": float("nan")},
+            {"expires_at": float("inf")},
+            {"ready_at": 1000.0, "expires_at": 1000.0},
+            {"ready_at": 1001.0, "expires_at": 1000.0},
             {"delivery_sequence": 0},
             {"spoken_text": None},
         ],
@@ -698,6 +796,16 @@ class TestProtocolAndPrivacy:
 
         assert manager.client.sent == []
         manager.hass.services.async_call.assert_not_awaited()
+
+    def test_runtime_idle_stability_rejects_bool(self):
+        with pytest.raises(ValueError, match="idle stability"):
+            BackgroundDeliveryManager(
+                MagicMock(),
+                FakeClient(),
+                route_id="entry-1",
+                directory=SatelliteDirectory(),
+                idle_stability_ms=True,
+            )
 
     @pytest.mark.parametrize(
         ("device", "reason"),

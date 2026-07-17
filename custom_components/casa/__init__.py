@@ -92,8 +92,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         agent_role=agent_role,
         directory=directory,
     )
-    listener.attach()
     try:
+        listener.attach()
         if transport == TRANSPORT_WS:
             await client.start_background(
                 route_id=entry.entry_id,
@@ -128,8 +128,10 @@ async def _async_options_updated(hass: HomeAssistant, entry: ConfigEntry) -> Non
 
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     ok = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
+    if not ok:
+        return False
     if entry.runtime_data is not None:
         entry.runtime_data.listener.detach()
         await entry.runtime_data.manager.close()
         await entry.runtime_data.client.close()
-    return ok
+    return True

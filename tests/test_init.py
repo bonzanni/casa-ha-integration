@@ -148,7 +148,10 @@ class TestSetup:
                 await async_setup_entry(hass, entry)
 
     @pytest.mark.asyncio
-    @pytest.mark.parametrize("failure_seam", ["start_background", "forward_platforms"])
+    @pytest.mark.parametrize(
+        "failure_seam",
+        ["listener_attach", "start_background", "forward_platforms"],
+    )
     async def test_setup_abort_after_attach_cleans_listener_manager_and_client(
         self, failure_seam,
     ):
@@ -174,7 +177,11 @@ class TestSetup:
             mock_listener.return_value.detach.side_effect = lambda: order.append("listener")
             mock_manager.return_value.close = AsyncMock(side_effect=close_manager)
             mock_cls.return_value = client
-            if failure_seam == "start_background":
+            if failure_seam == "listener_attach":
+                mock_listener.return_value.attach.side_effect = RuntimeError(
+                    "listener failed",
+                )
+            elif failure_seam == "start_background":
                 client.start_background.side_effect = ConnectionError("offline")
             else:
                 hass.config_entries.async_forward_entry_setups.side_effect = RuntimeError(
@@ -186,6 +193,32 @@ class TestSetup:
 
             assert order == ["listener", "manager", "client"]
             assert entry.runtime_data is None
+
+    @pytest.mark.asyncio
+    async def test_failed_platform_unload_keeps_runtime_resources_active(self):
+        hass = MagicMock()
+        hass.config_entries.async_forward_entry_setups = AsyncMock()
+        hass.config_entries.async_unload_platforms = AsyncMock(return_value=False)
+        entry = _entry()
+        with patch("custom_components.casa.CasaApiClient") as mock_cls, \
+             patch("custom_components.casa.SessionRegistrationListener") as mock_listener, \
+             patch("custom_components.casa.SatelliteDirectory"), \
+             patch("custom_components.casa.BackgroundDeliveryManager") as mock_manager:
+            client = MagicMock()
+            client.health_check = AsyncMock(return_value=True)
+            client.start_background = AsyncMock()
+            client.close = AsyncMock()
+            mock_manager.return_value.close = AsyncMock()
+            mock_cls.return_value = client
+            await async_setup_entry(hass, entry)
+            runtime = entry.runtime_data
+
+            assert await async_unload_entry(hass, entry) is False
+
+            assert entry.runtime_data is runtime
+            mock_listener.return_value.detach.assert_not_called()
+            mock_manager.return_value.close.assert_not_awaited()
+            client.close.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_unload_order_is_listener_then_manager_then_client(self):

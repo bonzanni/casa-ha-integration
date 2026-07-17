@@ -40,19 +40,31 @@ class SessionRegistrationListener:
         self._directory = directory
         self._logged_sse_noop = False
         self._tracker = None
+        self._registry_unsubscribe = None
 
     def attach(self) -> None:
-        """Subscribe to assist_satellite state changes. Tear down via detach()."""
-        for state in self._hass.states.async_all("assist_satellite"):
-            self._update_directory(state)
+        """Subscribe to satellite state and registry changes. Tear down via detach()."""
         self._tracker = async_track_state_change_filtered(
             self._hass, TrackStates(False, set(), {"assist_satellite"}), self.handle,
         )
+        self._registry_unsubscribe = self._hass.bus.async_listen(
+            er.EVENT_ENTITY_REGISTRY_UPDATED,
+            self.handle_registry_update,
+        )
+        for state in self._hass.states.async_all("assist_satellite"):
+            self._update_directory(state)
 
     def detach(self) -> None:
-        if self._tracker is not None:
-            self._tracker.async_remove()
-            self._tracker = None
+        tracker = self._tracker
+        registry_unsubscribe = self._registry_unsubscribe
+        self._tracker = None
+        self._registry_unsubscribe = None
+        try:
+            if tracker is not None:
+                tracker.async_remove()
+        finally:
+            if registry_unsubscribe is not None:
+                registry_unsubscribe()
 
     @callback
     def handle(self, event: Any) -> None:
@@ -82,6 +94,32 @@ class SessionRegistrationListener:
                 agent_role=self._agent_role,
             )
         )
+
+    @callback
+    def handle_registry_update(self, event: Any) -> None:
+        """Refresh Assist bindings changed without an HA state transition."""
+        data = event.data
+        entity_id = data.get("entity_id")
+        old_entity_id = data.get("old_entity_id")
+        if (
+            isinstance(old_entity_id, str)
+            and old_entity_id.startswith("assist_satellite.")
+            and old_entity_id != entity_id
+        ):
+            self._directory.remove(old_entity_id)
+        if not (
+            isinstance(entity_id, str)
+            and entity_id.startswith("assist_satellite.")
+        ):
+            return
+        if data.get("action") == "remove":
+            self._directory.remove(entity_id)
+            return
+        state = self._hass.states.get(entity_id)
+        if state is None:
+            self._directory.remove(entity_id)
+            return
+        self._update_directory(state)
 
     def _update_directory(self, state: Any) -> str | None:
         """Resolve the registry binding afresh and record this exact entity."""

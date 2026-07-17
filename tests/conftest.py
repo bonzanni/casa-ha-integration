@@ -111,6 +111,7 @@ def _ensure_ha_stubs() -> None:
     ha_event.async_track_state_change_filtered = MagicMock(return_value=MagicMock())
 
     ha_er = _make_stub_module("homeassistant.helpers.entity_registry")
+    ha_er.EVENT_ENTITY_REGISTRY_UPDATED = "entity_registry_updated"
     ha_er.async_get = MagicMock(return_value=MagicMock())
 
     ha_si = _make_stub_module("homeassistant.helpers.service_info")
