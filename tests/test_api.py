@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 from unittest.mock import AsyncMock, MagicMock
 
 import aiohttp
@@ -194,6 +195,9 @@ class _FakeWS:
     def feed_json(self, frame: dict) -> None:
         self._incoming.put_nowait(_FakeWSMsg("TEXT", json.dumps(frame)))
 
+    def feed_error(self, error: Exception) -> None:
+        self._incoming.put_nowait(error)
+
     def disconnect(self) -> None:
         self.closed = True
         self._incoming.put_nowait(self._CLOSED)
@@ -209,6 +213,8 @@ class _FakeWS:
         msg = await self._incoming.get()
         if msg is self._CLOSED:
             raise StopAsyncIteration
+        if isinstance(msg, Exception):
+            raise msg
         return msg
 
 
@@ -579,6 +585,73 @@ class TestBackgroundDelivery:
         await client.close()
 
     @pytest.mark.asyncio
+    async def test_only_current_socket_generation_dispatches_inbound_jobs(self):
+        session = MagicMock()
+        first = _FakeWS(stay_open=True)
+        second = _FakeWS(stay_open=True)
+        session.ws_connect = AsyncMock(side_effect=[first, second])
+        received: list[dict] = []
+        handled = asyncio.Event()
+
+        async def handler(frame):
+            received.append(frame)
+            await client.send_job_frame({
+                "type": "job_claimed",
+                "protocol": 1,
+                "job_id": frame["job_id"],
+                "delivery_attempt_id": frame["delivery_attempt_id"],
+            })
+            handled.set()
+
+        client = CasaApiClient(session=session, host="h", port=1, webhook_secret="sec")
+        ack = {
+            "type": "voice_route_registered",
+            "protocol": 1,
+            "accepted_capabilities": ["background_jobs", "satellite_announce"],
+        }
+        old_job = {
+            "type": "job_ready",
+            "protocol": 1,
+            "job_id": "job-old-generation",
+            "delivery_attempt_id": "attempt-old-generation",
+        }
+        current_job = {
+            "type": "job_ready",
+            "protocol": 1,
+            "job_id": "job-current-generation",
+            "delivery_attempt_id": "attempt-current-generation",
+        }
+
+        try:
+            await client.start_background(
+                route_id="entry-1", agent_role="concierge", job_handler=handler,
+            )
+            first.feed_json(ack)
+            await _wait_until(lambda: client.background_capable)
+
+            # Install and acknowledge generation 2 without ending generation 1's reader.
+            first.closed = True
+            await client._ensure_ws()
+            second.feed_json(ack)
+            await _wait_until(lambda: client.background_capable)
+
+            first.feed_json(old_job)
+            await _wait_until(lambda: first._incoming.empty())
+            assert received == []
+
+            second.feed_json(current_job)
+            await asyncio.wait_for(handled.wait(), timeout=1)
+            assert received == [current_job]
+            assert second.sent[-1] == {
+                "type": "job_claimed",
+                "protocol": 1,
+                "job_id": "job-current-generation",
+                "delivery_attempt_id": "attempt-current-generation",
+            }
+        finally:
+            await client.close()
+
+    @pytest.mark.asyncio
     async def test_authorization_and_denial_frames_only_reach_job_handler(self):
         session = MagicMock()
         ws = _FakeWS(stay_open=True)
@@ -674,6 +747,125 @@ class TestBackgroundDelivery:
         ):
             assert canary not in caplog.text
         await client.close()
+
+    @pytest.mark.asyncio
+    async def test_reader_failure_does_not_log_sensitive_details(self, caplog):
+        caplog.set_level(logging.DEBUG, logger="custom_components.casa.api")
+        session = MagicMock()
+        first = _FakeWS(stay_open=True)
+        second = _FakeWS(stay_open=True)
+        session.ws_connect = AsyncMock(side_effect=[first, second])
+        canaries = (
+            "SECRET_READER_CANARY",
+            "ws://private-reader-host",
+            "job_id=private-reader-job",
+            "spoken=private-reader-result",
+        )
+        client = CasaApiClient(session=session, host="h", port=1, webhook_secret="sec")
+
+        try:
+            await client.start_background(
+                route_id="entry-1", agent_role="concierge", job_handler=AsyncMock(),
+            )
+            first.feed_error(RuntimeError(" ".join(canaries)))
+            await _wait_until(lambda: "Casa WebSocket reader failed" in caplog.text)
+
+            record = next(
+                record for record in caplog.records
+                if record.getMessage() == "Casa WebSocket reader failed"
+            )
+            assert record.exc_info is None
+            for canary in canaries:
+                assert canary not in caplog.text
+        finally:
+            await client.close()
+
+    @pytest.mark.asyncio
+    async def test_reconnect_failure_does_not_log_sensitive_details(
+        self, caplog, monkeypatch,
+    ):
+        import custom_components.casa.api as api_mod
+
+        caplog.set_level(logging.DEBUG, logger="custom_components.casa.api")
+        sleep_started = asyncio.Event()
+
+        async def blocked_sleep(_delay):
+            sleep_started.set()
+            await asyncio.Event().wait()
+
+        monkeypatch.setattr(api_mod, "_sleep", blocked_sleep)
+        session = MagicMock()
+        ws = _FakeWS(stay_open=True)
+        canaries = (
+            "SECRET_RECONNECT_CANARY",
+            "ws://private-reconnect-host",
+            "job_id=private-reconnect-job",
+            "spoken=private-reconnect-result",
+        )
+        session.ws_connect = AsyncMock(
+            side_effect=[ws, RuntimeError(" ".join(canaries))],
+        )
+        client = CasaApiClient(session=session, host="h", port=1, webhook_secret="sec")
+
+        try:
+            await client.start_background(
+                route_id="entry-1", agent_role="concierge", job_handler=AsyncMock(),
+            )
+            ws.disconnect()
+            await asyncio.wait_for(sleep_started.wait(), timeout=1)
+
+            record = next(
+                record for record in caplog.records
+                if record.getMessage()
+                == "Casa WebSocket reconnect failed; retry scheduled"
+            )
+            assert record.exc_info is None
+            for canary in canaries:
+                assert canary not in caplog.text
+        finally:
+            await client.close()
+
+    @pytest.mark.asyncio
+    async def test_cancel_failure_does_not_log_sensitive_details(self, caplog):
+        caplog.set_level(logging.DEBUG, logger="custom_components.casa.api")
+        session = MagicMock()
+        ws = _FakeWS(outgoing=[
+            _FakeWSMsg("TEXT", json.dumps({
+                "type": "block", "utterance_id": "u-private",
+                "text": "private spoken result", "final": False,
+            })),
+        ], stay_open=True)
+        session.ws_connect = AsyncMock(return_value=ws)
+        canaries = (
+            "SECRET_CANCEL_CANARY",
+            "ws://private-cancel-host",
+            "utterance_id=u-private",
+            "spoken=private-cancel-result",
+        )
+        client = CasaApiClient(session=session, host="h", port=1, webhook_secret="sec")
+        utterance = client.stream_utterance(
+            text="private prompt",
+            agent_role="concierge",
+            scope_id="dev-private",
+            utterance_id="u-private",
+            context={},
+            transport="ws",
+        )
+
+        try:
+            assert (await utterance.__anext__()).text == "private spoken result"
+            ws.send_json = AsyncMock(side_effect=RuntimeError(" ".join(canaries)))
+            await utterance.aclose()
+
+            record = next(
+                record for record in caplog.records
+                if record.getMessage() == "Cancel frame failed; connection likely closed"
+            )
+            assert record.exc_info is None
+            for canary in canaries:
+                assert canary not in caplog.text
+        finally:
+            await client.close()
 
     @pytest.mark.asyncio
     async def test_all_ws_writes_share_one_global_writer(self):

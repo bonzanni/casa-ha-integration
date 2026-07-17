@@ -88,11 +88,19 @@ class CasaApiClient:
     @property
     def background_capable(self) -> bool:
         """Whether the current socket negotiated the background protocol."""
-        ws = self._ws
-        generation = self._ws_generation
+        return self._is_background_capable_for(self._ws, self._ws_generation)
+
+    def _is_background_capable_for(
+        self,
+        ws: aiohttp.ClientWebSocketResponse | None,
+        generation: int,
+    ) -> bool:
+        """Whether an exact socket generation negotiated background delivery."""
         return bool(
             not self._closed
             and ws is not None
+            and self._ws is ws
+            and self._ws_generation == generation
             and not ws.closed
             and self._route_ack.is_set()
             and self._route_ack_generation == generation
@@ -300,7 +308,7 @@ class CasaApiClient:
                 except asyncio.CancelledError:
                     raise
                 except Exception:
-                    _LOGGER.debug("Casa WebSocket reader failed", exc_info=True)
+                    _LOGGER.debug("Casa WebSocket reader failed")
             if self._closed:
                 return
 
@@ -314,11 +322,7 @@ class CasaApiClient:
                     return
                 delay = self._ws_backoff
                 self._ws_backoff = min(self._ws_backoff * 2, WS_RECONNECT_MAX)
-                _LOGGER.debug(
-                    "Casa WebSocket reconnect failed; retrying in %s seconds",
-                    delay,
-                    exc_info=True,
-                )
+                _LOGGER.debug("Casa WebSocket reconnect failed; retry scheduled")
                 await _sleep(delay)
 
     async def _read_loop(
@@ -341,7 +345,10 @@ class CasaApiClient:
                     await self._handle_route_ack(frame, ws, generation)
                     continue
                 if isinstance(frame_type, str) and frame_type.startswith("job_"):
-                    if self.background_capable and self._job_handler is not None:
+                    if (
+                        self._is_background_capable_for(ws, generation)
+                        and self._job_handler is not None
+                    ):
                         try:
                             await self._job_handler(frame)
                         except asyncio.CancelledError:
@@ -431,7 +438,7 @@ class CasaApiClient:
                         "type": "cancel", "utterance_id": utterance_id,
                     }, ws=ws, generation=generation)
                 except Exception:
-                    _LOGGER.debug("Cancel frame failed — connection likely closed", exc_info=True)
+                    _LOGGER.debug("Cancel frame failed; connection likely closed")
 
     async def start_background(
         self,
