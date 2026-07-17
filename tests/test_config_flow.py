@@ -256,9 +256,11 @@ class TestHassio:
         flow.hass = MagicMock()
         info = HassioServiceInfo(
             config={
+                "schema_version": 1,
                 "host": "casa.local",
                 "port": 18065,
                 "webhook_secret": "secret",
+                "addon": "casa",
             },
             name="Casa Add-on",
             slug="casa",
@@ -269,12 +271,59 @@ class TestHassio:
 
         assert result["type"] == "form"
         assert result["step_id"] == "hassio_confirm"
+        assert result["description_placeholders"] == {
+            "name": "Casa Add-on",
+            "host": "casa.local",
+            "port": "18065",
+        }
         assert flow.abort_entries_match_calls == [
             {CONF_HOST: "casa.local", CONF_PORT: 18065},
         ]
 
     @pytest.mark.asyncio
-    async def test_exact_host_port_duplicate_aborts_discovery(self):
+    @pytest.mark.parametrize(
+        "config",
+        [
+            {},
+            {"schema_version": 1, "host": "casa", "port": 18065},
+            {"schema_version": 1, "host": "casa", "port": True,
+             "webhook_secret": "secret"},
+            {"schema_version": 1, "host": "casa", "port": 65536,
+             "webhook_secret": "secret"},
+            {"schema_version": True, "host": "casa", "port": 18065,
+             "webhook_secret": "secret"},
+            {"schema_version": 2, "host": "casa", "port": 18065,
+             "webhook_secret": "secret"},
+            {"schema_version": 1, "host": "", "port": 18065,
+             "webhook_secret": "secret"},
+            {"schema_version": 1, "host": "casa", "port": 18065,
+             "webhook_secret": ""},
+            {"schema_version": 1, "host": "casa", "port": 18065,
+             "token": "legacy-secret"},
+            {"schema_version": 1, "host": "casa", "port": 18065,
+             "webhook_secret": "secret", "unexpected": "value"},
+        ],
+    )
+    async def test_rejects_malformed_or_legacy_discovery_payload(self, config):
+        from homeassistant.helpers.service_info.hassio import HassioServiceInfo
+
+        flow = CasaConfigFlow()
+        flow.hass = MagicMock()
+        info = HassioServiceInfo(
+            config=config,
+            name="Casa Add-on",
+            slug="casa",
+            uuid="uuid-1",
+        )
+
+        result = await flow.async_step_hassio(info)
+
+        assert result == {"type": "abort", "reason": "invalid_discovery"}
+        assert flow.abort_entries_match_calls == []
+        assert flow.unique_id is None
+
+    @pytest.mark.asyncio
+    async def test_new_discovery_preserves_exact_endpoint_duplicate_protection(self):
         from homeassistant.helpers.service_info.hassio import HassioServiceInfo
 
         flow = CasaConfigFlow()
@@ -283,7 +332,13 @@ class TestHassio:
             side_effect=RuntimeError("duplicate endpoint"),
         )
         info = HassioServiceInfo(
-            config={"host": "casa.local", "port": 18065, "token": "secret"},
+            config={
+                "schema_version": 1,
+                "host": "casa.local",
+                "port": 18065,
+                "webhook_secret": "secret",
+                "addon": "casa",
+            },
             name="Casa Add-on",
             slug="casa",
             uuid="uuid-1",
@@ -296,6 +351,61 @@ class TestHassio:
             CONF_HOST: "casa.local",
             CONF_PORT: 18065,
         })
+
+    @pytest.mark.asyncio
+    async def test_rediscovery_updates_existing_parent_and_reloads_without_catalog(self):
+        from homeassistant.helpers.service_info.hassio import HassioServiceInfo
+
+        child = _agent_subentry()
+        children = {child.subentry_id: child}
+        entry = SimpleNamespace(
+            entry_id="entry-1",
+            data={
+                CONF_HOST: "old-casa.local",
+                CONF_PORT: 18065,
+                CONF_WEBHOOK_SECRET: "old-secret",
+            },
+            subentries=children,
+        )
+        flow = CasaConfigFlow()
+        flow.hass = MagicMock()
+        flow.async_set_unique_id = AsyncMock(return_value=entry)
+        update = MagicMock(return_value={
+            "type": "abort", "reason": "discovery_updated",
+        })
+        flow.async_update_reload_and_abort = update
+        info = HassioServiceInfo(
+            config={
+                "schema_version": 1,
+                "host": "casa.local",
+                "port": 18066,
+                "webhook_secret": "rotated-secret",
+                "addon": "casa",
+            },
+            name="Casa Add-on",
+            slug="casa",
+            uuid="uuid-1",
+        )
+
+        with patch(
+            "custom_components.casa.config_flow._fetch_catalog",
+            AsyncMock(side_effect=AssertionError("must not fetch catalog")),
+        ):
+            result = await flow.async_step_hassio(info)
+
+        assert result == {"type": "abort", "reason": "discovery_updated"}
+        update.assert_called_once_with(
+            entry,
+            data_updates={
+                CONF_HOST: "casa.local",
+                CONF_PORT: 18066,
+                CONF_WEBHOOK_SECRET: "rotated-secret",
+            },
+            reason="discovery_updated",
+        )
+        assert entry.subentries is children
+        assert entry.subentries[child.subentry_id] is child
+        assert flow.abort_entries_match_calls == []
 
     @pytest.mark.asyncio
     async def test_confirmation_creates_parent_with_catalog_children(self):

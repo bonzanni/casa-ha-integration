@@ -101,7 +101,13 @@ def _ensure_ha_stubs() -> None:
             self.unique_id = None
 
         def async_show_form(self, *, step_id, data_schema=None, errors=None, **kw):
-            return _ConfigFlowResult(type="form", step_id=step_id, data_schema=data_schema, errors=errors or {})
+            return _ConfigFlowResult(
+                type="form",
+                step_id=step_id,
+                data_schema=data_schema,
+                errors=errors or {},
+                **kw,
+            )
 
         def async_create_entry(
             self, *, title, data, subentries=(), options=None, **kw,

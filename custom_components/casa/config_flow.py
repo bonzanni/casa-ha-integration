@@ -30,11 +30,13 @@ from .catalog import (
     initial_subentry_data,
 )
 from .const import (
+    CONF_DISCOVERY_SCHEMA_VERSION,
     CONF_HOST,
     CONF_IDLE_STABILITY_MS,
     CONF_PORT,
     CONF_SATELLITE_ENTITY_OVERRIDES,
     CONF_SESSION_MODE,
+    CONF_SUPERVISOR_ADDON,
     CONF_TRANSPORT,
     CONF_WEBHOOK_SECRET,
     DEFAULT_IDLE_STABILITY_MS,
@@ -47,6 +49,7 @@ from .const import (
     SESSION_MODE_DEVICE,
     SESSION_MODE_USER,
     SUBENTRY_TYPE_AGENT,
+    SUPERVISOR_DISCOVERY_SCHEMA_VERSION,
     TRANSPORT_SSE,
     TRANSPORT_WS,
 )
@@ -73,6 +76,46 @@ TRANSPORT_OPTIONS = {
     TRANSPORT_WS: "WebSocket",
     TRANSPORT_SSE: "SSE",
 }
+
+_SUPERVISOR_DISCOVERY_KEYS = frozenset({
+    CONF_DISCOVERY_SCHEMA_VERSION,
+    CONF_HOST,
+    CONF_PORT,
+    CONF_WEBHOOK_SECRET,
+    CONF_SUPERVISOR_ADDON,
+})
+
+
+def _supervisor_discovery_data(config: Any) -> dict[str, Any] | None:
+    """Return validated Casa Supervisor discovery data, or ``None``.
+
+    Supervisor adds ``addon`` to an app's published payload. It is accepted but
+    deliberately not persisted: Casa's wire contract owns the remaining four
+    exact, versioned fields.
+    """
+    if not isinstance(config, Mapping) or set(config) - _SUPERVISOR_DISCOVERY_KEYS:
+        return None
+
+    schema_version = config.get(CONF_DISCOVERY_SCHEMA_VERSION)
+    host = config.get(CONF_HOST)
+    port = config.get(CONF_PORT)
+    webhook_secret = config.get(CONF_WEBHOOK_SECRET)
+    if (
+        type(schema_version) is not int
+        or schema_version != SUPERVISOR_DISCOVERY_SCHEMA_VERSION
+        or not isinstance(host, str)
+        or not host
+        or type(port) is not int
+        or not 1 <= port <= 65535
+        or not isinstance(webhook_secret, str)
+        or not webhook_secret
+    ):
+        return None
+    return {
+        CONF_HOST: host,
+        CONF_PORT: port,
+        CONF_WEBHOOK_SECRET: webhook_secret,
+    }
 
 
 def _canonical_satellite_overrides(hass: Any, raw: Any) -> str:
@@ -188,20 +231,27 @@ class CasaConfigFlow(ConfigFlow, domain=DOMAIN):
         self,
         discovery_info: HassioServiceInfo,
     ) -> ConfigFlowResult:
-        self._host = discovery_info.config["host"]
-        self._port = discovery_info.config["port"]
-        self._secret = (
-            discovery_info.config.get("webhook_secret")
-            or discovery_info.config.get("token", "")
-        )
+        data = _supervisor_discovery_data(discovery_info.config)
+        if data is None:
+            return self.async_abort(reason="invalid_discovery")
+
+        self._host = data[CONF_HOST]
+        self._port = data[CONF_PORT]
+        self._secret = data[CONF_WEBHOOK_SECRET]
         self._discovery_name = discovery_info.name
+
+        existing = await self.async_set_unique_id(discovery_info.uuid)
+        if existing is not None:
+            return self.async_update_reload_and_abort(
+                existing,
+                data_updates=data,
+                reason="discovery_updated",
+            )
 
         self._async_abort_entries_match({
             CONF_HOST: self._host,
             CONF_PORT: self._port,
         })
-        await self.async_set_unique_id(discovery_info.uuid)
-        self._abort_if_unique_id_configured()
 
         self.context.update({
             "title_placeholders": {"name": discovery_info.name},
@@ -252,7 +302,11 @@ class CasaConfigFlow(ConfigFlow, domain=DOMAIN):
 
         return self.async_show_form(
             step_id="hassio_confirm",
-            description_placeholders={"name": self._discovery_name},
+            description_placeholders={
+                "name": self._discovery_name,
+                "host": self._host,
+                "port": str(self._port),
+            },
             errors=errors,
         )
 

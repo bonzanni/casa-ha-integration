@@ -22,6 +22,15 @@ current pipeline assignments, delete the existing Casa integration entry, add
 Casa again, and recreate affected Assist pipelines with the matching discovered
 agent.
 
+When Casa runs as a Supervisor app with webhook authentication enabled, Home
+Assistant discovers it automatically. Confirm the displayed host and port to
+connect; the versioned discovery record supplies the authenticated webhook
+secret. If discovery is unavailable, use **Settings → Devices & services → Add
+integration → Casa** and enter the exact host, port, and webhook secret
+manually. Rediscovery of the same Supervisor UUID updates the stored endpoint
+and secret, reloads the parent, and retains its Tina, Gary, and future
+voice-agent children.
+
 The parent Configure action contains only satellite entity overrides. Reconfigure
 each agent child to change session mode, WebSocket/SSE transport, or Assist idle
 stability; role and name remain catalog-owned. Removing a still-advertised child
