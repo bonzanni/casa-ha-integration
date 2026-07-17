@@ -5,24 +5,29 @@ from __future__ import annotations
 import asyncio
 import logging
 import uuid
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from typing import Literal
 
 import aiohttp
 
 from homeassistant.components import conversation
 from homeassistant.components.conversation import ChatLog
-from homeassistant.config_entries import ConfigEntry
+from homeassistant.config_entries import ConfigEntry, ConfigSubentry
 from homeassistant.const import MATCH_ALL
 from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers import intent
 
+from . import CasaAgentRuntime
 from .api import AuthenticationError, BlockFrame, ErrorFrame
 from .const import (
-    CONF_AGENT_ROLE, CONF_SESSION_MODE, CONF_TRANSPORT,
-    DEFAULT_AGENT_ROLE, DEFAULT_SESSION_MODE, DEFAULT_TRANSPORT,
-    DOMAIN, FALLBACK, INTEGRATION_VERSION, SILENT_STREAM_FALLBACK,
-    SESSION_MODE_CONVERSATION, SESSION_MODE_DEVICE, SESSION_MODE_USER,
+    DOMAIN,
+    FALLBACK,
+    INTEGRATION_VERSION,
+    SILENT_STREAM_FALLBACK,
+    SESSION_MODE_CONVERSATION,
+    SESSION_MODE_DEVICE,
+    SESSION_MODE_USER,
+    SUBENTRY_TYPE_AGENT,
     TIMEOUT_TOTAL,
 )
 
@@ -40,16 +45,28 @@ def _ha_context_payload(user_input: conversation.ConversationInput) -> dict:
 
 class CasaConversationEntity(conversation.ConversationEntity):
     _attr_has_entity_name = False
-    _attr_name = "Casa Butler"
     _attr_supports_streaming = True
 
-    def __init__(self, entry: ConfigEntry) -> None:
+    def __init__(
+        self,
+        entry: ConfigEntry,
+        subentry: ConfigSubentry,
+        runtime: CasaAgentRuntime,
+    ) -> None:
         self.entry = entry
-        self._client = entry.runtime_data.client
-        self._agent_role = entry.options.get(CONF_AGENT_ROLE, DEFAULT_AGENT_ROLE)
-        self._session_mode = entry.options.get(CONF_SESSION_MODE, DEFAULT_SESSION_MODE)
-        self._transport = entry.options.get(CONF_TRANSPORT, DEFAULT_TRANSPORT)
-        self._attr_unique_id = entry.entry_id
+        self._runtime = runtime
+        self._client = runtime.client
+        self._agent_role = runtime.role
+        self._session_mode = runtime.session_mode
+        self._transport = runtime.transport
+        self._availability_unsubscribe: Callable[[], None] | None = None
+        self._attr_name = subentry.title
+        self._attr_unique_id = runtime.entity_unique_id
+
+    @property
+    def available(self) -> bool:
+        """Return availability for this exact child runtime only."""
+        return self._runtime.available
 
     @property
     def supported_languages(self) -> list[str] | Literal["*"]:
@@ -58,13 +75,29 @@ class CasaConversationEntity(conversation.ConversationEntity):
     @property
     def device_info(self) -> dr.DeviceInfo:
         return dr.DeviceInfo(
-            identifiers={(DOMAIN, self.entry.entry_id)},
+            identifiers={(DOMAIN, self._runtime.entity_unique_id)},
             name="Casa",
             manufacturer="Casa",
-            model=f"Butler ({self._agent_role})",
+            model=f"{self._runtime.name} ({self._agent_role})",
             sw_version=INTEGRATION_VERSION,
             entry_type=dr.DeviceEntryType.SERVICE,
         )
+
+    async def async_added_to_hass(self) -> None:
+        """Subscribe this entity to only its child runtime's availability."""
+        await super().async_added_to_hass()
+        self._availability_unsubscribe = (
+            self._runtime.async_add_availability_listener(
+                self.async_write_ha_state,
+            )
+        )
+
+    async def async_will_remove_from_hass(self) -> None:
+        """Release this entity's child-local availability subscription."""
+        if self._availability_unsubscribe is not None:
+            self._availability_unsubscribe()
+            self._availability_unsubscribe = None
+        await super().async_will_remove_from_hass()
 
     def _build_scope_id(self, user_input: conversation.ConversationInput) -> str:
         uid = user_input.context.user_id if user_input.context else None
@@ -83,6 +116,11 @@ class CasaConversationEntity(conversation.ConversationEntity):
         user_input: conversation.ConversationInput,
         chat_log: ChatLog,
     ) -> conversation.ConversationResult:
+        if self._client is None:
+            return self._error_result(
+                user_input,
+                ErrorFrame(kind_="connection", spoken=""),
+            )
         scope_id = self._build_scope_id(user_input)
         utterance_id = str(uuid.uuid4())
         saw_content = False
@@ -156,4 +194,11 @@ class CasaConversationEntity(conversation.ConversationEntity):
 
 
 async def async_setup_entry(hass, entry, async_add_entities):
-    async_add_entities([CasaConversationEntity(entry)])
+    for subentry in entry.subentries.values():
+        if subentry.subentry_type != SUBENTRY_TYPE_AGENT:
+            continue
+        runtime = entry.runtime_data.agents[subentry.subentry_id]
+        async_add_entities(
+            [CasaConversationEntity(entry, subentry, runtime)],
+            config_subentry_id=subentry.subentry_id,
+        )
