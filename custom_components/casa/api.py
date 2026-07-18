@@ -35,6 +35,7 @@ from .const import (
 
 _LOGGER = logging.getLogger(__name__)
 _sleep = asyncio.sleep
+_HANDOFF_VALUE_MAX_LENGTH = 512
 
 
 @dataclass(frozen=True)
@@ -54,6 +55,31 @@ class ErrorFrame:
     kind_: str
     spoken: str
     kind: str = "error"
+
+
+@dataclass(frozen=True)
+class HandoffFrame:
+    handoff_id: str
+    text: str
+    kind: str = "handoff"
+
+
+def _bounded_nonempty_handoff_value(value: Any) -> str | None:
+    if (
+        not isinstance(value, str)
+        or not value.strip()
+        or len(value) > _HANDOFF_VALUE_MAX_LENGTH
+    ):
+        return None
+    return value
+
+
+def _parse_handoff_frame(frame: dict) -> HandoffFrame | None:
+    handoff_id = _bounded_nonempty_handoff_value(frame.get("handoff_id"))
+    text = _bounded_nonempty_handoff_value(frame.get("text"))
+    if handoff_id is None or text is None:
+        return None
+    return HandoffFrame(handoff_id=handoff_id, text=text)
 
 
 class AuthenticationError(Exception):
@@ -486,6 +512,15 @@ class CasaApiClient:
                         except Exception:
                             _LOGGER.error("Background job frame handler failed")
                     continue
+                if frame_type == "handoff_received":
+                    handoff = _parse_handoff_frame(frame)
+                    uid = _bounded_nonempty_handoff_value(
+                        frame.get("utterance_id"),
+                    )
+                    queue = self._ws_queues.get((generation, uid)) if uid else None
+                    if handoff is not None and queue is not None:
+                        await queue.put(handoff)
+                    continue
                 uid = frame.get("utterance_id")
                 queue = self._ws_queues.get((generation, uid)) if uid else None
                 if queue is None:
@@ -520,6 +555,7 @@ class CasaApiClient:
                 and frame["protocol"] == VOICE_ROUTE_PROTOCOL
                 and isinstance(accepted, (list, tuple, set, frozenset))
                 and all(isinstance(capability, str) for capability in accepted)
+                and frozenset(accepted) == frozenset(VOICE_ROUTE_CAPABILITIES)
             ):
                 self._accepted_capabilities = frozenset(accepted)
             else:
@@ -555,6 +591,10 @@ class CasaApiClient:
             await self._send_json(utterance, ws=ws, generation=generation)
             while True:
                 frame = await queue.get()
+                if isinstance(frame, HandoffFrame):
+                    terminated = True
+                    yield frame
+                    return
                 t = frame.get("type")
                 if t == "__closed__":
                     terminated = True
