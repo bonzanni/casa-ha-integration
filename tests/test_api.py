@@ -421,7 +421,22 @@ async def _collect_ws_utterance(
 
 class TestStreamUtteranceWS:
     @pytest.mark.asyncio
-    async def test_handoff_received_is_routed_to_its_utterance_queue_and_is_terminal(self):
+    async def test_socket_loss_before_handoff_returns_connection_error_without_receipt(self):
+        session = MagicMock()
+        ws = _FakeWS(stay_open=True)
+        session.ws_connect = AsyncMock(return_value=ws)
+        client = CasaApiClient(session=session, host="h", port=1, webhook_secret="sec")
+
+        utterance = asyncio.create_task(_collect_ws_utterance(client))
+        await _wait_until(lambda: any(frame.get("type") == "utterance" for frame in ws.sent))
+        ws.disconnect()
+
+        assert await utterance == [ErrorFrame(kind_="connection", spoken="")]
+        assert not any(frame.get("type") == "handoff_received" for frame in ws.sent)
+        await client.close()
+
+    @pytest.mark.asyncio
+    async def test_handoff_is_acknowledged_and_terminal(self):
         session = MagicMock()
         ws = _FakeWS(stay_open=True)
         session.ws_connect = AsyncMock(return_value=ws)
@@ -430,17 +445,21 @@ class TestStreamUtteranceWS:
         utterance = asyncio.create_task(_collect_ws_utterance(client))
         await _wait_until(lambda: any(frame.get("type") == "utterance" for frame in ws.sent))
         ws.feed_json({
-            "type": "handoff_received",
+            "type": "handoff",
             "utterance_id": "u-1",
             "handoff_id": "handoff-1",
             "text": "I will look into that.",
         })
 
-        frames = await utterance
+        frames = await asyncio.wait_for(utterance, timeout=0.1)
 
         assert frames == [HandoffFrame(
             handoff_id="handoff-1", text="I will look into that.",
         )]
+        assert [frame for frame in ws.sent if frame.get("type") == "handoff_received"] == [{
+            "type": "handoff_received",
+            "handoff_id": "handoff-1",
+        }]
         assert not any(frame.get("type") == "cancel" for frame in ws.sent)
         await client.close()
 
@@ -460,47 +479,51 @@ class TestStreamUtteranceWS:
                 lambda: any(frame.get("type") == "utterance" for frame in ws.sent),
             )
             ws.feed_json({
-                "type": "handoff_received",
+                "type": "handoff",
                 "utterance_id": "u-1",
                 "handoff_id": "",
                 "text": canary,
             })
             ws.feed_json({
-                "type": "handoff_received",
+                "type": "handoff",
                 "utterance_id": "different-utterance",
                 "handoff_id": "handoff-2",
                 "text": canary,
             })
             ws.feed_json({
-                "type": "handoff_received",
+                "type": "handoff",
                 "utterance_id": "u-1",
                 "handoff_id": "handoff-" + "x" * 513,
                 "text": canary,
             })
             ws.feed_json({
-                "type": "handoff_received",
+                "type": "handoff",
                 "utterance_id": "u-1",
                 "handoff_id": "handoff-2",
                 "text": "x" * 513,
             })
             ws.feed_json({
-                "type": "handoff_received",
+                "type": "handoff",
                 "utterance_id": ["u-1"],
                 "handoff_id": "handoff-2",
                 "text": canary,
             })
             ws.feed_json({
-                "type": "handoff_received",
+                "type": "handoff",
                 "utterance_id": "u-1",
                 "handoff_id": "handoff-3",
                 "text": "I will look into that.",
             })
 
-            frames = await utterance
+            frames = await asyncio.wait_for(utterance, timeout=0.1)
 
         assert frames == [HandoffFrame(
             handoff_id="handoff-3", text="I will look into that.",
         )]
+        assert [frame for frame in ws.sent if frame.get("type") == "handoff_received"] == [{
+            "type": "handoff_received",
+            "handoff_id": "handoff-3",
+        }]
         assert canary not in caplog.text
         await client.close()
 
