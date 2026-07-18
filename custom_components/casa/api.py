@@ -595,11 +595,15 @@ class CasaApiClient:
                     handoff = _parse_handoff_frame(frame)
                     if handoff is None:
                         continue
-                    await self._send_json({
-                        "type": "handoff_received",
-                        "handoff_id": handoff.handoff_id,
-                    }, ws=ws, generation=generation)
                     terminated = True
+                    try:
+                        await self._send_json({
+                            "type": "handoff_received",
+                            "handoff_id": handoff.handoff_id,
+                        }, ws=ws, generation=generation)
+                    except (aiohttp.ClientError, OSError):
+                        yield ErrorFrame(kind_="connection", spoken="")
+                        return
                     yield handoff
                     return
                 if t == "block":
