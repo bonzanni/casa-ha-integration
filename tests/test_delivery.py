@@ -48,6 +48,31 @@ class FakeClock:
             await asyncio.sleep(0)
 
 
+class ChangeDuringStateReadDirectory(SatelliteDirectory):
+    """Inject one state generation after returning a stale state snapshot."""
+
+    def __init__(self, clock: FakeClock) -> None:
+        super().__init__()
+        self._clock = clock
+        self._inject_on_next_state_read = False
+
+    def inject_change_on_next_state_read(self) -> None:
+        self._inject_on_next_state_read = True
+
+    def state(self, device_id: str) -> str | None:
+        state = super().state(device_id)
+        if self._inject_on_next_state_read:
+            self._inject_on_next_state_read = False
+            entity_id = self.resolve(device_id)
+            self.set_entity_state(
+                device_id, entity_id, "listening", changed_at=self._clock.now,
+            )
+            self.set_entity_state(
+                device_id, entity_id, "idle", changed_at=self._clock.now,
+            )
+        return state
+
+
 class FakeClient:
     def __init__(self) -> None:
         self.sent: list[dict] = []
@@ -724,7 +749,7 @@ class TestFinalRechecksAndRevocation:
         manager.hass.services.async_call.assert_awaited_once()
 
     @pytest.mark.parametrize("invalidation", ["state", "rebind"])
-    async def test_playback_started_send_revalidates_before_announce(
+    async def test_playback_started_send_invalidations_nack_without_announce(
         self, delivery_manager, invalidation,
     ):
         manager, clock = delivery_manager
@@ -748,10 +773,12 @@ class TestFinalRechecksAndRevocation:
         await manager.handle_frame(job_ready("job-1"))
         await manager.drain_for_test()
 
-        assert sent_types(manager.client)[-1] == "job_playback_started"
-        assert "job_nack" not in sent_types(manager.client)
+        assert sent_types(manager.client)[-1] == "job_nack"
+        assert manager.client.sent[-1]["reason"] == "preempted_before_playback"
+        assert "job_delivered" not in sent_types(manager.client)
         assert "job_revoked" not in sent_types(manager.client)
         manager.hass.services.async_call.assert_not_awaited()
+        assert manager.directory.playback_slot_count_for_test == 0
 
     async def test_authorization_wait_is_bounded_to_ten_seconds(self, delivery_manager):
         manager, clock = delivery_manager
@@ -799,6 +826,161 @@ class TestFinalRechecksAndRevocation:
         assert manager.client.sent[-1]["type"] == "job_nack"
         assert manager.client.sent[-1]["reason"] == "preempted_before_playback"
         manager.hass.services.async_call.assert_not_awaited()
+
+    async def test_activity_after_idle_wait_before_authorization_nacks(
+        self, delivery_manager,
+    ):
+        manager, clock = delivery_manager
+        manager.directory.set_state("dev-k", "idle", changed_at=clock.now - 10)
+        manager.client.authorize = False
+
+        async def reset_idle_before_authorization(frame):
+            if frame["type"] != "job_delivery_start":
+                return
+            manager.directory.set_state("dev-k", "listening", changed_at=clock.now)
+            manager.directory.set_state("dev-k", "idle", changed_at=clock.now)
+            await manager.handle_frame({
+                "type": "job_delivery_authorized",
+                "protocol": 1,
+                "job_id": frame["job_id"],
+                "delivery_attempt_id": frame["delivery_attempt_id"],
+            })
+
+        manager.client.on_send = reset_idle_before_authorization
+        await manager.handle_frame(job_ready("job-1"))
+        await manager.drain_for_test()
+
+        assert manager.client.sent[-1]["type"] == "job_nack"
+        assert manager.client.sent[-1]["reason"] == "preempted_before_playback"
+        assert "job_delivered" not in sent_types(manager.client)
+        manager.hass.services.async_call.assert_not_awaited()
+        assert manager.directory.playback_slot_count_for_test == 0
+
+    async def test_activity_while_waiting_authorization_nacks(
+        self, delivery_manager,
+    ):
+        manager, clock = delivery_manager
+        manager.directory.set_state("dev-k", "idle", changed_at=clock.now - 10)
+        manager.client.authorize = False
+
+        await manager.handle_frame(job_ready("job-1"))
+        await clock.settle()
+        assert sent_types(manager.client) == ["job_claimed", "job_delivery_start"]
+
+        manager.directory.set_state("dev-k", "listening", changed_at=clock.now)
+        manager.directory.set_state("dev-k", "idle", changed_at=clock.now)
+        await manager.handle_frame({
+            "type": "job_delivery_authorized",
+            "protocol": 1,
+            "job_id": "job-1",
+            "delivery_attempt_id": "attempt-job-1",
+        })
+        await manager.drain_for_test()
+
+        assert manager.client.sent[-1]["type"] == "job_nack"
+        assert manager.client.sent[-1]["reason"] == "preempted_before_playback"
+        assert "job_delivered" not in sent_types(manager.client)
+        manager.hass.services.async_call.assert_not_awaited()
+        assert manager.directory.playback_slot_count_for_test == 0
+
+    async def test_change_after_authorization_before_announce_nacks(
+        self,
+    ):
+        clock = FakeClock()
+        directory = ChangeDuringStateReadDirectory(clock)
+        directory.add("dev-k", "assist_satellite.kitchen")
+        directory.set_state("dev-k", "idle", changed_at=clock.now - 10)
+        client = FakeClient()
+        hass = MagicMock()
+        hass.services.async_call = AsyncMock()
+        manager = BackgroundDeliveryManager(
+            hass,
+            client,
+            route_id="entry-1",
+            directory=directory,
+            idle_stability_ms=750,
+            clock=clock,
+        )
+        client.manager = manager
+
+        async def change_before_announce(frame):
+            if frame["type"] == "job_playback_started":
+                directory.inject_change_on_next_state_read()
+
+        client.on_send = change_before_announce
+        try:
+            await manager.handle_frame(job_ready("job-1"))
+            await manager.drain_for_test()
+
+            assert client.sent[-1]["type"] == "job_nack"
+            assert client.sent[-1]["reason"] == "preempted_before_playback"
+            assert "job_delivered" not in sent_types(client)
+            hass.services.async_call.assert_not_awaited()
+            assert directory.playback_slot_count_for_test == 0
+        finally:
+            await manager.close()
+
+    async def test_waiting_agent_does_not_announce_stale_entity_after_slot_release(
+        self,
+    ):
+        clock = FakeClock()
+        directory = SatelliteDirectory()
+        directory.add("dev-k", "assist_satellite.kitchen")
+        directory.set_state("dev-k", "idle", changed_at=clock.now - 10)
+        hass = MagicMock()
+        first_started = asyncio.Event()
+        release_first = asyncio.Event()
+
+        async def announce(_domain, _service, data, *, blocking):
+            assert blocking is True
+            if data["entity_id"] == "assist_satellite.kitchen":
+                first_started.set()
+                await release_first.wait()
+
+        hass.services.async_call = AsyncMock(side_effect=announce)
+        first_client = FakeClient()
+        waiting_client = FakeClient()
+        first = BackgroundDeliveryManager(
+            hass,
+            first_client,
+            route_id="entry-1:first",
+            directory=directory,
+            clock=clock,
+        )
+        waiting = BackgroundDeliveryManager(
+            hass,
+            waiting_client,
+            route_id="entry-1:waiting",
+            directory=directory,
+            clock=clock,
+        )
+        first_client.manager = first
+        waiting_client.manager = waiting
+        try:
+            await first.handle_frame(job_ready(
+                "first-job", route_id="entry-1:first",
+            ))
+            await asyncio.wait_for(first_started.wait(), timeout=1)
+            await waiting.handle_frame(job_ready(
+                "waiting-job", route_id="entry-1:waiting",
+            ))
+            await clock.settle()
+
+            directory.remove("assist_satellite.kitchen")
+            directory.add("dev-k", "assist_satellite.kitchen_2")
+            directory.set_state("dev-k", "idle", changed_at=clock.now - 10)
+            release_first.set()
+            await asyncio.gather(first.drain_for_test(), waiting.drain_for_test())
+
+            assert hass.services.async_call.await_count == 1
+            assert waiting_client.sent[-1]["type"] == "job_nack"
+            assert waiting_client.sent[-1]["reason"] == "preempted_before_playback"
+            assert "job_delivered" not in sent_types(waiting_client)
+            assert directory.playback_slot_count_for_test == 0
+        finally:
+            release_first.set()
+            await first.close()
+            await waiting.close()
 
     @pytest.mark.parametrize(
         ("change", "reason"),
