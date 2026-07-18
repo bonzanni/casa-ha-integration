@@ -512,17 +512,12 @@ class CasaApiClient:
                         except Exception:
                             _LOGGER.error("Background job frame handler failed")
                     continue
-                if frame_type == "handoff_received":
-                    handoff = _parse_handoff_frame(frame)
-                    uid = _bounded_nonempty_handoff_value(
-                        frame.get("utterance_id"),
-                    )
-                    queue = self._ws_queues.get((generation, uid)) if uid else None
-                    if handoff is not None and queue is not None:
-                        await queue.put(handoff)
-                    continue
                 uid = frame.get("utterance_id")
-                queue = self._ws_queues.get((generation, uid)) if uid else None
+                queue = (
+                    self._ws_queues.get((generation, uid))
+                    if isinstance(uid, str) and uid
+                    else None
+                )
                 if queue is None:
                     continue
                 await queue.put(frame)
@@ -591,14 +586,21 @@ class CasaApiClient:
             await self._send_json(utterance, ws=ws, generation=generation)
             while True:
                 frame = await queue.get()
-                if isinstance(frame, HandoffFrame):
-                    terminated = True
-                    yield frame
-                    return
                 t = frame.get("type")
                 if t == "__closed__":
                     terminated = True
                     yield ErrorFrame(kind_="connection", spoken="")
+                    return
+                if t == "handoff":
+                    handoff = _parse_handoff_frame(frame)
+                    if handoff is None:
+                        continue
+                    await self._send_json({
+                        "type": "handoff_received",
+                        "handoff_id": handoff.handoff_id,
+                    }, ws=ws, generation=generation)
+                    terminated = True
+                    yield handoff
                     return
                 if t == "block":
                     yield BlockFrame(text=frame.get("text", ""), final=bool(frame.get("final", False)))

@@ -18,7 +18,7 @@ from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers import intent
 
 from . import CasaAgentRuntime
-from .api import AuthenticationError, BlockFrame, ErrorFrame
+from .api import AuthenticationError, BlockFrame, ErrorFrame, HandoffFrame
 from .const import (
     DOMAIN,
     FALLBACK,
@@ -125,49 +125,77 @@ class CasaConversationEntity(conversation.ConversationEntity):
         utterance_id = str(uuid.uuid4())
         saw_content = False
         error_frame: ErrorFrame | None = None
+        handoff_frame: HandoffFrame | None = None
 
-        async def _deltas() -> AsyncIterator[dict]:
-            nonlocal saw_content, error_frame
+        stream = self._client.stream_utterance(
+            text=user_input.text,
+            agent_role=self._agent_role,
+            scope_id=scope_id,
+            utterance_id=utterance_id,
+            context=_ha_context_payload(user_input),
+            transport=self._transport,
+        )
+
+        async def _deltas(first_frame) -> AsyncIterator[dict]:
+            nonlocal saw_content, error_frame, handoff_frame
             first = True
-            try:
-                async with asyncio.timeout(TIMEOUT_TOTAL):
-                    async for frame in self._client.stream_utterance(
-                        text=user_input.text,
-                        agent_role=self._agent_role,
-                        scope_id=scope_id,
-                        utterance_id=utterance_id,
-                        context=_ha_context_payload(user_input),
-                        transport=self._transport,
-                    ):
-                        if isinstance(frame, ErrorFrame):
-                            error_frame = frame
-                            return
-                        if isinstance(frame, BlockFrame):
-                            if not frame.text:
-                                _LOGGER.debug("Dropping empty block frame")
-                                continue
-                            saw_content = True
-                            d: dict = {"content": frame.text}
-                            if first:
-                                d["role"] = "assistant"
-                                first = False
-                            yield d
-                        # DoneFrame → loop ends naturally.
-            except asyncio.TimeoutError:
-                error_frame = ErrorFrame(kind_="timeout", spoken="")
-            except AuthenticationError:
-                self.entry.async_start_reauth(self.hass)
-                error_frame = ErrorFrame(kind_="auth", spoken="")
-            except (aiohttp.ClientError, OSError):
-                error_frame = ErrorFrame(kind_="connection", spoken="")
+            frame = first_frame
+            while frame is not None:
+                if isinstance(frame, HandoffFrame):
+                    handoff_frame = frame
+                    return
+                if isinstance(frame, ErrorFrame):
+                    error_frame = frame
+                    return
+                if isinstance(frame, BlockFrame):
+                    if not frame.text:
+                        _LOGGER.debug("Dropping empty block frame")
+                    else:
+                        saw_content = True
+                        d: dict = {"content": frame.text}
+                        if first:
+                            d["role"] = "assistant"
+                            first = False
+                        yield d
+                try:
+                    frame = await anext(stream)
+                except StopAsyncIteration:
+                    return
 
-        async for _ in chat_log.async_add_delta_content_stream(
-            user_input.agent_id, _deltas()
-        ):
-            pass
+        try:
+            async with asyncio.timeout(TIMEOUT_TOTAL):
+                try:
+                    first_frame = await anext(stream)
+                except StopAsyncIteration:
+                    first_frame = None
+                if isinstance(first_frame, HandoffFrame):
+                    handoff_frame = first_frame
+                elif isinstance(first_frame, ErrorFrame):
+                    error_frame = first_frame
+                elif first_frame is not None:
+                    async for _ in chat_log.async_add_delta_content_stream(
+                        user_input.agent_id, _deltas(first_frame)
+                    ):
+                        pass
+        except asyncio.TimeoutError:
+            error_frame = ErrorFrame(kind_="timeout", spoken="")
+        except AuthenticationError:
+            self.entry.async_start_reauth(self.hass)
+            error_frame = ErrorFrame(kind_="auth", spoken="")
+        except (aiohttp.ClientError, OSError):
+            error_frame = ErrorFrame(kind_="connection", spoken="")
+        finally:
+            await stream.aclose()
 
         if error_frame is not None:
             return self._error_result(user_input, error_frame)
+        if handoff_frame is not None:
+            response = intent.IntentResponse(language=user_input.language)
+            response.async_set_speech(handoff_frame.text, speech_type="plain")
+            return conversation.ConversationResult(
+                response=response,
+                conversation_id=user_input.conversation_id,
+            )
         if not saw_content:
             return self._silent_stream_fallback(user_input)
         return conversation.async_get_result_from_chat_log(user_input, chat_log)
