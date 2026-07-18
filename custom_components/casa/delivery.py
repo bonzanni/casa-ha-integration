@@ -388,7 +388,7 @@ class BackgroundDeliveryManager:
         if not await self._wait_for_stable_idle(delivery):
             await self._abort_idle_wait(delivery)
             return
-        if not self._ready_for_playback(delivery):
+        if not self._has_current_stable_idle_claim(delivery):
             await self._abort_preplay(delivery)
             return
         key = (delivery.job_id, delivery.attempt_id)
@@ -409,12 +409,16 @@ class BackgroundDeliveryManager:
                 await self._nack(delivery, "authorization_timeout")
             return
         delivery.phase = "authorized"
-        if not self._ready_for_playback(delivery):
+        if not self._has_current_stable_idle_claim(delivery):
             await self._abort_preplay(delivery)
             return
         delivery.phase = "playing"
         await self._send(self._frame(delivery, "job_playback_started"))
-        if not self._ready_for_playback(delivery):
+        if not self._has_current_stable_idle_claim(
+            delivery,
+            require_preplay_state=False,
+        ):
+            await self._abort_preplay(delivery)
             return
         announce_started = self._clock.now
         await self.hass.services.async_call(
@@ -576,20 +580,37 @@ class BackgroundDeliveryManager:
                 return_exceptions=True,
             )
 
-    def _ready_for_playback(self, delivery: _Delivery) -> bool:
-        if (
-            self._expired(delivery)
-            or delivery.revoked.is_set()
-            or delivery.lease_lost.is_set()
-        ):
-            return False
+    def _has_current_stable_idle_claim(
+        self,
+        delivery: _Delivery,
+        *,
+        require_preplay_state: bool = True,
+    ) -> bool:
+        """Verify this slot still holds the exact, stably idle satellite."""
+        event = self.directory.change_event(delivery.device_id)
         try:
+            if require_preplay_state and (
+                self._expired(delivery)
+                or delivery.revoked.is_set()
+                or delivery.lease_lost.is_set()
+            ):
+                return False
+            if event.is_set() or (
+                self.directory.resolve(delivery.device_id) != delivery.entity_id
+            ):
+                return False
+            state = self.directory.state(delivery.device_id)
+            idle_since = self.directory.idle_since(delivery.device_id)
             return bool(
-                self.directory.resolve(delivery.device_id) == delivery.entity_id
-                and self.directory.state(delivery.device_id) == "idle"
+                not event.is_set()
+                and state == "idle"
+                and idle_since is not None
+                and self._clock.now - idle_since >= self._idle_stability_s
             )
         except SatelliteResolutionError:
             return False
+        finally:
+            self.directory.discard_change_event(delivery.device_id, event)
 
     def _expired(self, delivery: _Delivery) -> bool:
         return self._clock.now >= delivery.expires_at
