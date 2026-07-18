@@ -1,7 +1,7 @@
 # Casa HA Integration
 
 Companion custom integration that connects Home Assistant to the
-[Casa add-on](https://github.com/bonzanni/casa-ha-app). Integration v0.5.1
+[Casa add-on](https://github.com/bonzanni/casa-ha-app). Integration v0.6.0
 creates one **Casa** parent from the server's authenticated voice-agent catalog,
 then exposes separate role-stable conversation entities for Butler, Concierge,
 and future catalog-discovered agents. Each entity has its own routing, connection,
@@ -20,21 +20,24 @@ jobs.
   network.
 - HACS (Home Assistant Community Store).
 
-## Compatibility and v0.4.0 upgrade
+## Compatibility and coordinated v0.6.0 upgrade
 
-Upgrade the Casa server before installing integration v0.4.0. Older Casa
-servers do not expose `GET /api/voice/agents` and cannot create a new v0.4.0
-entry or reconcile its catalog. An existing v0.4.0 entry with retained children
+Upgrade Casa to v0.90.0 before installing integration v0.6.0. The releases are
+coordinated: specialist handoff uses WebSocket protocol 2 and requires the
+complete `background_jobs`, `satellite_announce`, and `voice_handoff`
+capability set. Protocol 1 or a missing `voice_handoff` capability fails closed
+before a job is created; there is no legacy handoff fallback.
+
+Older Casa servers do not expose `GET /api/voice/agents` and cannot create a new
+v0.6.0 entry or reconcile its catalog. An existing v0.6.0 entry with retained children
 may load in degraded mode without catalog reconciliation while the endpoint is
 unavailable, but it cannot discover new, renamed, or restored agents. This
 recovery behavior does not replace the supported server-first upgrade order:
 the server endpoint release must land before the integration release.
 
-v0.4.0 is a clean break from v0.3.0; there is no automatic entry migration.
-Before upgrading, note which pipelines use Casa. Then delete the existing Casa
-integration entry, install v0.4.0, add Casa again, and recreate affected Assist
-pipelines with the matching discovered agent. This avoids retaining the old
-single-entity configuration or an obsolete pipeline entity reference.
+v0.6.0 has no legacy voice-handoff compatibility mode. Upgrade the coordinated
+Casa server and integration pair together; protocol-1 routes are not migrated
+or used for a fallback specialist job.
 
 Casa checks an HMAC of the empty HTTP upgrade body to authenticate the
 integration client when the WebSocket is established. That handshake does not
@@ -44,8 +47,8 @@ connection on a trusted LAN, private network, or encrypted tunnel.
 
 ## Install and configure
 
-1. Upgrade Casa to the server release that includes the authenticated agent
-   catalog endpoint.
+1. Upgrade Casa to v0.90.0, which includes the authenticated agent catalog and
+   the coordinated protocol-2 voice-handoff contract.
 2. In HACS, open **Integrations** → **⋮** → **Custom repositories**.
 3. Add `https://github.com/bonzanni/casa-ha-integration` with category
    **Integration**.
@@ -122,11 +125,19 @@ delivery manager, availability state, and cleanup boundary. Only the satellite
 directory and state listener are shared. A disconnected, missing, or failing
 child does not change another child's availability or routing.
 
-With WebSocket transport, each agent registers a protocol-1 route and
-advertises `background_jobs` plus `satellite_announce`. Background delivery is
-enabled only after Casa acknowledges both capabilities on that exact socket
-generation. A role using SSE remains available for synchronous turns without a
-persistent socket.
+With WebSocket transport, each agent registers a protocol-2 route and
+advertises the complete `background_jobs`, `satellite_announce`, and
+`voice_handoff` capability set. Concierge handoff is enabled only after Casa
+acknowledges every capability on that exact socket generation. Protocol 1 or an
+incomplete registration fails closed before Casa creates the specialist job;
+there is no legacy handoff fallback. A role using SSE remains available for
+synchronous turns without a persistent socket.
+
+For a Concierge specialist request, the terminal `HandoffFrame` is returned as
+the normal Assist `ConversationResult`: the user hears the fixed acknowledgement
+immediately, may continue or cancel normally, and hears the completed result
+when the originating satellite is idle. Butler's direct home-control turns do
+not use asynchronous handoff.
 
 Completed work is queued per satellite. If the satellite is already idle it is
 announced immediately; otherwise the integration waits for the current voice
@@ -147,7 +158,7 @@ being silently lost.
 ## Release acceptance
 
 Release acceptance has two layers: reproducible real-system exercises and
-automated fault-injection gates. Both must pass before publishing v0.5.1.
+automated fault-injection gates. Both must pass before publishing v0.6.0.
 
 ### Real-system E2E
 

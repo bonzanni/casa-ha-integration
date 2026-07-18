@@ -50,7 +50,7 @@ def test_ack_loss_replay_boundary_is_explicit(filename):
     assert "can never replay after a manager or integration process restart" not in text
 
 
-def test_release_metadata_is_v051_with_existing_ha_minimum():
+def test_release_metadata_is_v060_with_existing_ha_minimum():
     manifest = json.loads(
         (_ROOT / "custom_components/casa/manifest.json").read_text(
             encoding="utf-8",
@@ -58,7 +58,7 @@ def test_release_metadata_is_v051_with_existing_ha_minimum():
     )
     hacs = json.loads((_ROOT / "hacs.json").read_text(encoding="utf-8"))
 
-    assert manifest["version"] == "0.5.1"
+    assert manifest["version"] == "0.6.0"
     assert hacs["homeassistant"] == "2026.4.0"
 
 
@@ -90,18 +90,31 @@ def test_readme_documents_parent_and_child_configuration_boundaries():
 
 
 @pytest.mark.parametrize("filename", ["README.md", "info.md"])
-def test_clean_break_and_server_first_compatibility_are_explicit(filename):
+def test_coordinated_voice_handoff_upgrade_is_explicit(filename):
     text = _normalized(filename)
 
-    assert "v0.4.0 is a clean break" in text
-    assert "delete the existing Casa integration entry" in text
-    assert "recreate affected Assist pipelines" in text
-    assert "Upgrade the Casa server before installing integration v0.4.0" in text
+    assert "Upgrade Casa to v0.90.0 before installing integration v0.6.0" in text
+    assert "WebSocket protocol 2" in text
+    assert "background_jobs" in text
+    assert "satellite_announce" in text
+    assert "voice_handoff" in text
+    assert "fails closed before a job is created" in text
+    assert "no legacy handoff fallback" in text
     assert "GET /api/voice/agents" in text
-    assert "cannot create a new v0.4.0 entry" in text
-    assert "existing v0.4.0 entry with retained children may load in degraded mode" in text
+    assert "cannot create a new v0.6.0 entry" in text
+    assert "existing v0.6.0 entry with retained children may load in degraded mode" in text
     assert "without catalog reconciliation" in text
-    assert "cannot configure or start against them" not in text
+
+
+@pytest.mark.parametrize("filename", ["README.md", "info.md"])
+def test_handoff_user_experience_and_butler_boundary_are_explicit(filename):
+    text = _normalized(filename)
+
+    assert "HandoffFrame" in text
+    assert "continue or cancel normally" in text
+    assert "originating satellite is idle" in text
+    assert "Butler" in text
+    assert "direct" in text
 
 
 def test_readme_e2e_matrix_covers_dynamic_agent_release_boundaries():
