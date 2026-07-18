@@ -311,12 +311,20 @@ class TestStreamUtteranceSSE:
 class _FakeWS:
     _CLOSED = object()
 
-    def __init__(self, outgoing=None, *, stay_open: bool = False, auto_done: bool = False):
+    def __init__(
+        self,
+        outgoing=None,
+        *,
+        stay_open: bool = False,
+        auto_done: bool = False,
+        fail_handoff_receipt: bool = False,
+    ):
         self.sent: list[dict] = []
         self._outgoing = list(outgoing or [])
         self._incoming: asyncio.Queue = asyncio.Queue()
         self._stay_open = stay_open
         self._auto_done = auto_done
+        self._fail_handoff_receipt = fail_handoff_receipt
         self.closed = False
         self.concurrent_send = 0
         self.max_concurrent_send = 0
@@ -327,6 +335,11 @@ class _FakeWS:
         try:
             # Make overlapping writers observable to the concurrency test.
             await asyncio.sleep(0)
+            if (
+                self._fail_handoff_receipt
+                and data.get("type") == "handoff_received"
+            ):
+                raise ConnectionError("handoff receipt write failed")
             self.sent.append(data)
             if self._auto_done and data.get("type") == "utterance":
                 self.feed_json({"type": "done", "utterance_id": data["utterance_id"]})
@@ -462,6 +475,54 @@ class TestStreamUtteranceWS:
         }]
         assert not any(frame.get("type") == "cancel" for frame in ws.sent)
         await client.close()
+
+    @pytest.mark.asyncio
+    async def test_handoff_receipt_send_failure_returns_connection_error_without_cancel(self):
+        session = MagicMock()
+        ws = _FakeWS(stay_open=True, fail_handoff_receipt=True)
+        session.ws_connect = AsyncMock(return_value=ws)
+        client = CasaApiClient(session=session, host="h", port=1, webhook_secret="sec")
+
+        try:
+            utterance = asyncio.create_task(_collect_ws_utterance(client))
+            await _wait_until(
+                lambda: any(frame.get("type") == "utterance" for frame in ws.sent),
+            )
+            ws.feed_json({
+                "type": "handoff",
+                "utterance_id": "u-1",
+                "handoff_id": "handoff-1",
+                "text": "I will look into that.",
+            })
+
+            assert await utterance == [ErrorFrame(kind_="connection", spoken="")]
+            assert not any(frame.get("type") == "handoff_received" for frame in ws.sent)
+            assert not any(frame.get("type") == "cancel" for frame in ws.sent)
+
+            ws._fail_handoff_receipt = False
+            reoffer = asyncio.create_task(
+                _collect_ws_utterance(client, utterance_id="u-2"),
+            )
+            await _wait_until(
+                lambda: any(
+                    frame.get("type") == "utterance"
+                    and frame.get("utterance_id") == "u-2"
+                    for frame in ws.sent
+                ),
+            )
+            ws.feed_json({
+                "type": "handoff",
+                "utterance_id": "u-2",
+                "handoff_id": "handoff-2",
+                "text": "I will try again.",
+            })
+
+            assert await reoffer == [HandoffFrame(
+                handoff_id="handoff-2",
+                text="I will try again.",
+            )]
+        finally:
+            await client.close()
 
     @pytest.mark.asyncio
     async def test_malformed_or_mismatched_handoff_frames_are_dropped_without_payload_logging(

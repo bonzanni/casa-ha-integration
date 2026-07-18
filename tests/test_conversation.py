@@ -475,6 +475,21 @@ class TestHandleMessageHappy:
 
 class TestHandleMessageErrors:
     @pytest.mark.asyncio
+    async def test_handoff_receipt_failure_uses_connection_fallback_without_chat_log(self):
+        entity = _entity()
+        entity._client.stream_utterance = MagicMock(return_value=_aiter([
+            ErrorFrame(kind_="connection", spoken=""),
+        ]))
+        chat_log = MagicMock()
+        chat_log.async_add_delta_content_stream = AsyncMock()
+
+        result = await entity._async_handle_message(_input(device_id="d-1"), chat_log)
+
+        assert result.response._speech["speech"] == FALLBACK
+        assert result.response._speech["type"] == "plain"
+        chat_log.async_add_delta_content_stream.assert_not_awaited()
+
+    @pytest.mark.asyncio
     async def test_casa_error_with_spoken(self):
         entity = _entity()
         entity._client.stream_utterance = MagicMock(return_value=_aiter([
