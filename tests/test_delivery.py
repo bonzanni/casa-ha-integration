@@ -721,7 +721,7 @@ class TestFinalRechecksAndRevocation:
         assert queued_types == ["job_revoked"]
         assert manager.hass.services.async_call.await_count == 1
 
-    async def test_revoke_arriving_with_playback_started_is_already_too_late(
+    async def test_revoke_arriving_during_playback_started_acks_without_announce(
         self, delivery_manager,
     ):
         manager, clock = delivery_manager
@@ -743,10 +743,11 @@ class TestFinalRechecksAndRevocation:
         await manager.drain_for_test()
 
         types = sent_types(manager.client)
-        assert types[-2:] == ["job_playback_started", "job_delivered"]
+        assert types[-2:] == ["job_playback_started", "job_revoked"]
         assert "job_nack" not in types
-        assert "job_revoked" not in types
-        manager.hass.services.async_call.assert_awaited_once()
+        assert "job_delivered" not in types
+        manager.hass.services.async_call.assert_not_awaited()
+        assert manager.directory.playback_slot_count_for_test == 0
 
     @pytest.mark.parametrize("invalidation", ["state", "rebind"])
     async def test_playback_started_send_invalidations_nack_without_announce(

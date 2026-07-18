@@ -412,14 +412,11 @@ class BackgroundDeliveryManager:
         if not self._has_current_stable_idle_claim(delivery):
             await self._abort_preplay(delivery)
             return
-        delivery.phase = "playing"
         await self._send(self._frame(delivery, "job_playback_started"))
-        if not self._has_current_stable_idle_claim(
-            delivery,
-            require_preplay_state=False,
-        ):
+        if not self._has_current_stable_idle_claim(delivery):
             await self._abort_preplay(delivery)
             return
+        delivery.phase = "playing"
         announce_started = self._clock.now
         await self.hass.services.async_call(
             "assist_satellite",
